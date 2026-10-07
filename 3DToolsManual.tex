@@ -1097,8 +1097,10 @@ coplanar caps of nested cylinders, are painted larger first. A |3d/sphere|
 places the pieces around it: what is inside stays between its back and front
 shells, what lies on its surface (points, the arcs of
 |3d/circle on sphere|) goes just in front of the shell it lies on, in the
-order of the code, and what is outside goes behind or in front of the whole
-sphere. In a scene the hidden edges
+order of the code on the front and in the reverse order on the back (what is
+on top in front is at the bottom behind), and what is outside goes behind or
+in front of the whole sphere. A straight path is also cut where it passes the
+surface of a sphere. In a scene the hidden edges
 of the pics are drawn like visible ones: an opaque surface covers them, a
 translucent one tints them.
 

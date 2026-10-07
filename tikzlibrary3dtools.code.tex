@@ -2100,7 +2100,7 @@ projection prefix/.initial=tmpp}
 % piece of its own.
 \def\tikz@td@circle@draw#1#2#3#4#5#6{%
   \pgfmathsetmacro\tikz@td@kr{#2}%
-  \let\tikz@td@kext\tikz@td@kr
+  \ifx\tikz@td@kfront\relax\let\tikz@td@kext\tikz@td@kr\else\def\tikz@td@kext{0}\fi
   % canvas images of the frame vectors (x={(<3d point>)} would include shifts)
   \tikz@scan@one@point\pgfutil@firstofone(\tikz@td@kx)\relax
   \edef\tikz@td@kcx{\the\pgf@x,\the\pgf@y}%
@@ -2181,8 +2181,9 @@ projection prefix/.initial=tmpp}
 % applied to the arc from <a> to <b>, as a piece at the depth of the centroid
 % of the arc from <c> to <d>. Lines on a sphere cover each other only where
 % they cross, at equal depth: the visible ones all go just in front of the
-% front shell of the sphere (\tikz@td@kfront), the others just in front of
-% the back shell (\tikz@td@kback), in the order of the code.
+% front shell of the sphere (\tikz@td@kfront), in the order of the code, the
+% others just in front of the back shell (\tikz@td@kback), in the reverse
+% order (what is on top in front is at the bottom behind).
 \def\tikz@td@circle@arc#1#2#3#4{%
   \ifdim\fpeval{#4-(#3)}pt>359.999pt
     \def\pgfutil@tmpc{(0,0,0)}%
@@ -2192,7 +2193,7 @@ projection prefix/.initial=tmpp}
   \fi
   \ifx\tikz@td@kfront\relax\else
     \ifnum\tikz@td@kcls=1 \edef\pgfutil@tmpc{\fpeval{\tikz@td@kfront+0.01}}%
-    \else\edef\pgfutil@tmpc{\fpeval{\tikz@td@kback+0.01}}\fi
+    \else\edef\pgfutil@tmpc{\fpeval{\tikz@td@kback+0.01-0.000001*(\the\tikz@td@npieces+1)}}\fi
   \fi
   \ifdim\fpeval{#2-(#1)}pt>359.999pt
     \expandafter\tikz@td@piece\expandafter{\pgfutil@tmpc}{\pgfutil@tmpa (0,0) circle[radius=\tikz@td@kr];}%
@@ -4098,6 +4099,7 @@ create shading/.code={%
 \seq_new:N \g__tdtools_spheres_seq
 \seq_new:N \l__tdtools_out_seq
 \seq_new:N \l__tdtools_lines_seq
+\seq_new:N \l__tdtools_base_seq
 \seq_new:N \l__tdtools_lcuts_seq
 \seq_new:N \l__tdtools_lpts_seq
 \tl_new:N \l__tdtools_key_tl
@@ -4110,6 +4112,7 @@ create shading/.code={%
   { \str_case:nnF {#1} { { front } { 16000 } { back } { -16000 } } {#1} }
 \cs_new:Npn \__tdtools_item_key:nnnnnn #1#2#3#4#5#6 { \__tdtools_key:n {#1} }
 \cs_new:Npn \__tdtools_item_ext:nnnnnn #1#2#3#4#5#6 {#3}
+\cs_new:Npn \__tdtools_item_idx:nnnnnn #1#2#3#4#5#6 {#2}
 % --- geometry of a piece: tikz@td@pr@<i> = {x}{y}{depth}, tikz@td@pb@<i> =
 % {x0}{y0}{x1}{y1} (canvas, pt), both empty if unknown; tikz@td@pl@<i> =
 % {x0}{y0}{d0}{x1}{y1}{d1} for a straight path to be cut into runs
@@ -4235,15 +4238,26 @@ create shading/.code={%
           { \__tdtools_place:nnnnnnnnn ##1 #2 }
       }
   }
+% (\l__tdtools_pidx_tl: the piece; \l__tdtools_seg_tl: empty, or the
+% canvas segment {xa}{ya}{xb}{yb} of a run, then the run meets the disk of
+% the sphere if the segment does)
+\tl_new:N \l__tdtools_pidx_tl
+\tl_new:N \l__tdtools_seg_tl
 \cs_new_protected:Npn \__tdtools_place:nnnnnnnnn #1#2#3#4#5#6#7#8#9
   {
-    \fp_set:Nn \l_tmpa_fp { sqrt ( (#7 - #1) ^ 2 + (#8 - #2) ^ 2 ) }
+    \tl_if_empty:NTF \l__tdtools_seg_tl
+      { \fp_set:Nn \l_tmpa_fp { sqrt ( (#7 - #1) ^ 2 + (#8 - #2) ^ 2 ) } }
+      { \exp_last_unbraced:NV \__tdtools_segdist:nnnnnn \l__tdtools_seg_tl {#1} {#2} }
     \fp_compare:nNnT { \l_tmpa_fp } < { 1.02 * #4 }
       {
+        \fp_set:Nn \l_tmpa_fp { sqrt ( (#7 - #1) ^ 2 + (#8 - #2) ^ 2 ) }
         \fp_set:Nn \l_tmpb_fp { sqrt ( \l_tmpa_fp ^ 2 + (#9 - #3) ^ 2 ) }
-        \fp_compare:nNnF { \l_tmpb_fp } < { 0.98 * #4 }
+        % runs of straight paths are cut at the surface: inside or outside
+        \fp_compare:nNnF { \l_tmpb_fp }
+          < { \tl_if_empty:NTF \l__tdtools_seg_tl { 0.98 } { 1 } * #4 }
           {
-            \fp_compare:nNnTF { \l_tmpb_fp } > { 1.02 * #4 }
+            \fp_compare:nNnTF { \l_tmpb_fp }
+              > { \tl_if_empty:NTF \l__tdtools_seg_tl { 1.02 } { 1 } * #4 }
               {
                 % outside
                 \fp_compare:nNnTF {#9} < {#3}
@@ -4251,12 +4265,27 @@ create shading/.code={%
                   { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { max ( \l__tdtools_key_tl , #5 + 0.02 ) } } }
               }
               {
-                % on the surface
+                % on the surface (behind: in the reverse order)
                 \fp_compare:nNnTF {#9} < {#3}
-                  { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { #6 + 0.01 } } }
+                  { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { #6 + 0.01 - 0.000001 * \l__tdtools_pidx_tl } } }
                   { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { #5 + 0.01 } } }
               }
           }
+      }
+  }
+% \l_tmpa_fp = canvas distance of the point {#5}{#6} from the segment #1..#4
+\cs_new_protected:Npn \__tdtools_segdist:nnnnnn #1#2#3#4#5#6
+  {
+    \fp_set:Nn \l_tmpb_fp { (#3 - #1) ^ 2 + (#4 - #2) ^ 2 }
+    \fp_set:Nn \l_tmpb_fp
+      {
+        \l_tmpb_fp < 0.0001 ? 0 :
+        max ( 0 , min ( 1 , ( (#5 - #1) * (#3 - #1) + (#6 - #2) * (#4 - #2) ) / \l_tmpb_fp ) )
+      }
+    \fp_set:Nn \l_tmpa_fp
+      {
+        sqrt ( ( #5 - #1 - \l_tmpb_fp * (#3 - #1) ) ^ 2
+          + ( #6 - #2 - \l_tmpb_fp * (#4 - #2) ) ^ 2 )
       }
   }
 % --- the flush
@@ -4267,7 +4296,8 @@ create shading/.code={%
     \seq_map_inline:Nn \g__tdtools_pieces_seq { \__tdtools_geom:n { \use_ii:nnn ##1 } }
     % pieces that are not cut: placed with respect to the spheres
     \seq_map_inline:Nn \g__tdtools_pieces_seq { \__tdtools_flush_piece:nnn ##1 }
-    % straight paths: runs, cut at the depths of the pieces near them
+    % straight paths: runs, cut at the depths of the other pieces near them
+    \seq_set_eq:NN \l__tdtools_base_seq \l__tdtools_out_seq
     \seq_map_inline:Nn \l__tdtools_lines_seq { \__tdtools_flush_line:nnn ##1 }
     \seq_sort:Nn \l__tdtools_out_seq
       {
@@ -4275,10 +4305,21 @@ create shading/.code={%
           { \__tdtools_item_key:nnnnnn ##1 } > { \__tdtools_item_key:nnnnnn ##2 }
           { \sort_return_swapped: }
           {
-            \bool_lazy_and:nnTF
-              { \fp_compare_p:nNn { \__tdtools_item_key:nnnnnn ##1 } = { \__tdtools_item_key:nnnnnn ##2 } }
-              { \fp_compare_p:nNn { \__tdtools_item_ext:nnnnnn ##1 } < { \__tdtools_item_ext:nnnnnn ##2 } }
-              { \sort_return_swapped: } { \sort_return_same: }
+            % equal depths: larger first, then in the order of the code
+            \fp_compare:nNnTF
+              { \__tdtools_item_key:nnnnnn ##1 } = { \__tdtools_item_key:nnnnnn ##2 }
+              {
+                \fp_compare:nNnTF
+                  { \__tdtools_item_ext:nnnnnn ##1 } < { \__tdtools_item_ext:nnnnnn ##2 }
+                  { \sort_return_swapped: }
+                  {
+                    \bool_lazy_and:nnTF
+                      { \fp_compare_p:nNn { \__tdtools_item_ext:nnnnnn ##1 } = { \__tdtools_item_ext:nnnnnn ##2 } }
+                      { \int_compare_p:nNn { \__tdtools_item_idx:nnnnnn ##1 } > { \__tdtools_item_idx:nnnnnn ##2 } }
+                      { \sort_return_swapped: } { \sort_return_same: }
+                  }
+              }
+              { \sort_return_same: }
           }
       }
     \seq_map_inline:Nn \l__tdtools_out_seq { \__tdtools_emit:nnnnnn ##1 }
@@ -4295,6 +4336,8 @@ create shading/.code={%
     \tl_if_empty:cTF { tikz@td@pl@#2 }
       {
         \tl_set:Ne \l__tdtools_key_tl { \__tdtools_key:n {#1} }
+        \tl_set:Nn \l__tdtools_pidx_tl {#2}
+        \tl_clear:N \l__tdtools_seg_tl
         \str_if_eq:eeF { \use:c { tikz@td@pns@#2 } } { 1 }
           {
             \str_case:nnF {#1} { { front } { } { back } { } }
@@ -4312,7 +4355,8 @@ create shading/.code={%
     % as fractions of the path
     \seq_clear:N \l__tdtools_lcuts_seq
     \tl_set:Nn \l__tdtools_line_tl { {#1} {#2} {#3} {#4} {#5} {#6} }
-    \seq_map_inline:Nn \l__tdtools_out_seq { \__tdtools_cut:nnnnnn ##1 }
+    \seq_map_inline:Nn \l__tdtools_base_seq { \__tdtools_cut:nnnnnn ##1 }
+    \seq_map_inline:Nn \g__tdtools_spheres_seq { \__tdtools_cut_sphere:nnnnnn ##1 }
     \seq_sort:Nn \l__tdtools_lcuts_seq
       { \fp_compare:nNnTF {##1} > {##2} { \sort_return_swapped: } { \sort_return_same: } }
     \seq_remove_duplicates:N \l__tdtools_lcuts_seq
@@ -4326,6 +4370,14 @@ create shading/.code={%
             % the run from prev to ##1: depth and point of its middle (within the path)
             \fp_set:Nn \l_tmpa_fp { ( max ( \l__tdtools_prev_tl , 0 ) + min ( ##1 , 1 ) ) / 2 }
             \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { #3 + \l_tmpa_fp * (#6 - #3) } }
+            \tl_set:Nn \l__tdtools_pidx_tl {#7}
+            \tl_set:Ne \l__tdtools_seg_tl
+              {
+                { \fp_eval:n { #1 + max ( \l__tdtools_prev_tl , 0 ) * (#4 - #1) } }
+                { \fp_eval:n { #2 + max ( \l__tdtools_prev_tl , 0 ) * (#5 - #2) } }
+                { \fp_eval:n { #1 + min ( ##1 , 1 ) * (#4 - #1) } }
+                { \fp_eval:n { #2 + min ( ##1 , 1 ) * (#5 - #2) } }
+              }
             \exp_args:Nee \__tdtools_place:nn { \l__tdtools_key_tl }
               {
                 { \fp_eval:n { #1 + \l_tmpa_fp * (#4 - #1) } }
@@ -4358,6 +4410,46 @@ create shading/.code={%
             || \exp_last_unbraced:NV \__tdtools_boxhit_p:nnnnnnnn \l__tdtools_tmp_tl {#1} {#2} {#4} {#5}
           }
           { \seq_put_right:Ne \l__tdtools_lcuts_seq { \fp_eval:n { ( #7 - #3 ) / ( #6 - #3 ) } } }
+      }
+  }
+% a sphere {x}{y}{center depth}{radius}{front}{back} against the path: the
+% fractions where the path passes its surface are cuts
+\fp_new:N \l__tdtools_scx_fp
+\fp_new:N \l__tdtools_scy_fp
+\fp_new:N \l__tdtools_scd_fp
+\fp_new:N \l__tdtools_scr_fp
+\cs_new_protected:Npn \__tdtools_cut_sphere:nnnnnn #1#2#3#4#5#6
+  {
+    \fp_set:Nn \l__tdtools_scx_fp {#1}
+    \fp_set:Nn \l__tdtools_scy_fp {#2}
+    \fp_set:Nn \l__tdtools_scd_fp {#3}
+    \fp_set:Nn \l__tdtools_scr_fp {#4}
+    \exp_last_unbraced:NV \__tdtools_cut_sphere_aux:nnnnnn \l__tdtools_line_tl
+  }
+\cs_new_protected:Npn \__tdtools_cut_sphere_aux:nnnnnn #1#2#3#4#5#6
+  {
+    % |P0 - C + t (P1 - P0)|^2 = R^2, i.e. a t^2 + 2 b t + c = 0
+    \fp_set:Nn \l__tdtools_gx_fp { (#4 - #1) ^ 2 + (#5 - #2) ^ 2 + (#6 - #3) ^ 2 }
+    \fp_set:Nn \l__tdtools_gy_fp
+      {
+        (#1 - \l__tdtools_scx_fp) * (#4 - #1) + (#2 - \l__tdtools_scy_fp) * (#5 - #2)
+        + (#3 - \l__tdtools_scd_fp) * (#6 - #3)
+      }
+    \fp_set:Nn \l__tdtools_gd_fp
+      {
+        (#1 - \l__tdtools_scx_fp) ^ 2 + (#2 - \l__tdtools_scy_fp) ^ 2
+        + (#3 - \l__tdtools_scd_fp) ^ 2 - \l__tdtools_scr_fp ^ 2
+      }
+    \fp_set:Nn \l_tmpa_fp { \l__tdtools_gy_fp ^ 2 - \l__tdtools_gx_fp * \l__tdtools_gd_fp }
+    \fp_compare:nNnT { \l_tmpa_fp } > { 0 }
+      {
+        \clist_map_inline:nn { -1 , 1 }
+          {
+            \fp_set:Nn \l_tmpb_fp
+              { ( - \l__tdtools_gy_fp + ##1 * sqrt ( \l_tmpa_fp ) ) / \l__tdtools_gx_fp }
+            \fp_compare:nNnT { 0.001 < \l_tmpb_fp < 0.999 } = { 1 }
+              { \seq_put_right:Ne \l__tdtools_lcuts_seq { \fp_use:N \l_tmpb_fp } }
+          }
       }
   }
 % does the box {x0}{y0}{x1}{y1} meet the bounding box of the segment?
