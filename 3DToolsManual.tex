@@ -20,10 +20,14 @@
 \input{pgfmanual.code} % 
 \makeatother           % 
 \input{pgfmanual-en-macros.tex} % link from
+\makeatletter% recent LaTeX kernels list TAB in \dospecials, so codeexample
+% would keep leading TABs as characters; restore the old behaviour
+\def\code@catcode@hook{\catcode`\^^I=10\relax}%
+\makeatother
 % /usr/local/texlive/2020/texmf-dist/doc/generic/pgf/macros/pgfmanual-en-macros.tex
 % or the equivalent on your installation
 \def\pgfautoxrefs{1}
-\usetikzlibrary{3dtools,calc,angles}
+\usetikzlibrary{3dtools,3dtools.circleofsphere,calc,angles}
 \DeclareMathOperator{\sd}{sd}
 \begin{document}
 \section{3D Tools}
@@ -252,14 +256,50 @@ what the coordinates $A$, $B$ and $C$ are. It works because the coordinates in
 \tikzname\ are global, so they get remembered from the above example.
 
 
-\paragraph{Warning.} The expressions that are used in the coordinates will only
-be evaluated when they are retrieved. So, if you use, say, random numbers, you
-will get each time a \emph{different} result. This is because this library is
-working with |\tikz@dcl@coord@|\meta{coord}, where \meta{coord} is the name of
-the coordinate, say |A|. This is the string with which the coordinate was
-generated, e.g.\ |(1,2,3)|. However, the coordinate will always be at the same location. So
-you may want to avoid using functions that change their values when declaring
-coordinates that get used later in coordinate calculations. 
+\paragraph{Named coordinates.}
+\label{sec:NamedCoordinates}
+\tikzname\ only remembers where a named node or coordinate is on the canvas.
+To know the 3d point behind it, this library records, for every named node and
+coordinate, its canvas position together with its screen depth, i.e.\ its
+distance from the screen (see |screendepth| below). For any non-degenerate view,
+these two determine the point. The depth is tracked through
+\begin{itemize}
+ \item $(x,y,z)$, $(x,y)$ (which \tikzname\ reads as $(x,y,0)$) and polar
+ coordinates with dimensionless radii;
+ \item named coordinates and anchors: the anchors of a node have the depth of
+ the node, since nodes are flat on the screen;
+ \item |++(...)|, |+(...)|, |shift={(...)}| and local frames
+ (section~\ref{sec:LocalFrames});
+ \item sums, differences, factors and partway modifiers |!|\meta{t}|!| of the
+ |calc| library;
+ \item |coordinate[pos=|\meta{t}|]| on straight |--| segments.
+\end{itemize}
+So |\coordinate (P) at (1,2,3);|, |(A) ++(1,0,0) coordinate (P)| and
+|($(A)!0.5!(B)$) coordinate (M)| all give the expected points. A coordinate in
+canvas units, such as |(1cm,2cm)| or |(30:1cm)|, lies in the plane parallel to
+the screen through the origin of the coordinate system in force. The depth is
+\emph{not} tracked for distance and projection modifiers (|!1cm!|, |!(C)!|) and
+rotations in |calc|, perpendicular coordinates |(A|\verb+|-+|B)|, |pos=| on curves,
+arcs and \verb+-|+ or \verb+|-+ segments, intersections, and coordinates defined
+in |canvas is xy plane at z=0| and its relatives or with |reset cm|. For such
+coordinates |TD| issues a warning and falls back to the text with which the
+coordinate was defined, i.e.\ to the |\tikz@dcl@coord@|\meta{coord} macro of
+\tikzname, as earlier versions of this library did.
+
+Inside the picture in which a coordinate was defined, and under the same view,
+|TD("(P)")| yields $P$ in the coordinate system in force: in a scope with
+|shift={(1,0,0)}| a coordinate defined outside of it appears shifted by
+$(-1,0,0)$, and inside a local frame |TD| yields local coordinates. This is
+what pics and path constructions that take named points need. Elsewhere, i.e.\
+in node texts, outside of pictures and under a different view, |TD("(P)")|
+yields $P$ in the coordinate system in which $P$ was defined. The results are
+rounded to five decimals and accurate to about $10^{-5}$ ($10^{-4}$ in scaled
+pictures); a coordinate that was given as a list of plain numbers is returned
+exactly when |TD| is evaluated where it was defined. The |3d coordinate| key
+stores the computed vector itself, and |TD| of such a coordinate always returns
+that vector, which is what one wants for directions. Since the recorded position
+is used, a coordinate defined with random numbers yields the same value each
+time.
 
 \begin{codeexample}[width=4.5cm,preamble={\usetikzlibrary{3dtools}}]
 \begin{tikzpicture}
@@ -583,7 +623,11 @@ package.\footnote{I do not know how to contact the author.}
 		points, $(ex)$ is parallel to $(B)-(A)$, $(ey)$ is in the plane that
 		contains $(A)$, $(B)$ and $(C)$, and is orthogonal to $(ex)$, and $(ez)$
 		is orthogonal to $(ex)$ and $(ey)$. All the basis vectors are normalized
-		to length 1.
+		to length 1. To draw in the plane of the dreibein, use
+		|3d/install local frame=from dreibein| (section~\ref{sec:LocalFrames}).
+		Using the basis vectors directly, as in |x={(ex)}|, only works if they
+		have been defined without a shift because |x={(ex)}| uses the
+		position of |(ex)| on the canvas.
 \end{key}
 
 \begin{key}{/tikz/3d/screen coords}
@@ -592,6 +636,144 @@ package.\footnote{I do not know how to contact the author.}
 		from |tikz-3dplot|, where this style is called |tdplot_screen_coords|.
 \end{key}
 
+
+\subsection{Main and local frames}
+\label{sec:LocalFrames}
+
+The coordinates $(x,y,z)$ that are used after a view has been installed, e.g.\
+with |3d/install view|, refer to the \emph{main} frame. Many objects are much
+easier to describe in a \emph{local} (or secondary) frame. For instance, a
+circle in a tilted plane is just |(0,0) circle[radius=1]| in a frame whose $xy$
+plane is the tilted plane. A local frame is given by an origin $\vec O$ and
+three basis vectors $\vec e_x'$, $\vec e_y'$ and $\vec e_z'$, all specified in
+main coordinates. The point with local coordinates $(a,b,c)$ is
+\[\vec P=\vec O+a\,\vec e_x'+b\,\vec e_y'+c\,\vec e_z'\]
+in the main frame.
+
+\begin{key}{/tikz/3d/install local frame=\meta{options}}
+		Installs a local frame. It sets the |x|, |y| and |z| vectors to the
+		screen images of $\vec e_x'$, $\vec e_y'$ and $\vec e_z'$, and shifts
+		the origin to $\vec O$. Afterwards, |(a,b,c)| refers to the local frame,
+		and so do |(a,b)|, which \tikzname\ reads as |(a,b,0)|, polar
+		coordinates and circles, ellipses and arcs with dimensionless radii.
+		Things that live on the canvas, such as rectangles and node texts, are
+		not affected; use |canvas is xy plane at z=0| (and |transform shape|)
+		inside the local frame to put them in its $xy$ plane. The vectors in
+		\meta{options} are 3d expressions in the sense of |TD|, i.e.\ they can
+		be explicit, like |{(1,0,0)}|, named, like |(ex)|, or combinations,
+		like |(B)-(A)|. Values that contain commas must be enclosed in braces.
+		The vectors always refer to the main frame, even if another local frame
+		is active; local frames do not compose. Like all \tikzname\
+		transformations, the key takes effect after the other options of the
+		scope or path it is given to. If it fails because the basis vectors are
+		(almost) coplanar, a warning is issued and nothing changes.
+\end{key}
+
+\begin{key}{/tikz/3d/local frame/origin=\meta{point} (initially {(0,0,0)})}
+		Origin of the local frame.
+\end{key}
+\begin{key}{/tikz/3d/local frame/ex=\meta{vector} (initially {(1,0,0)})}
+		Local $x$ basis vector.
+\end{key}
+\begin{key}{/tikz/3d/local frame/ey=\meta{vector} (initially {(0,1,0)})}
+		Local $y$ basis vector.
+\end{key}
+\begin{key}{/tikz/3d/local frame/ez=\meta{vector} (initially empty)}
+		Local $z$ basis vector. If empty, $\vec e_z'=\vec e_x'\times\vec e_y'$.
+\end{key}
+\begin{key}{/tikz/3d/local frame/orthonormalize=\meta{boolean} (default true, initially false)}
+		If true, the basis is replaced by the right-handed orthonormal basis
+		with $\vec e_x'\parallel$ |ex| and $\vec e_y'$ in the plane of |ex|
+		and |ey|; |ez| is ignored. Otherwise the vectors are used as they are,
+		so the local frame may be skewed or scaled.
+\end{key}
+\begin{key}{/tikz/3d/local frame/name=\meta{name} (initially empty)}
+		Saves the frame under \meta{name} for later use with |3d/use local frame|.
+\end{key}
+\begin{key}{/tikz/3d/local frame/from dreibein}
+		Uses the frame defined by the last |3d/define orthonormal dreibein|,
+		i.e.\ origin |A| and basis vectors |ex|, |ey| and |ez|.
+\end{key}
+
+\begin{key}{/tikz/3d/use local frame=\meta{name}}
+		Installs a local frame that has been saved with |name=|\meta{name}.
+\end{key}
+
+\begin{key}{/tikz/3d/main frame}
+		Goes back to the main frame inside a local frame, e.g.\ for a single
+		path. The main frame consists of the |x|, |y| and |z| vectors and the
+		transformation that were in force when the first local frame of the
+		current scope got installed.
+\end{key}
+
+\begin{codeexample}[width=5cm,preamble={\usetikzlibrary{3dtools}}]
+\begin{tikzpicture}[3d/install view={phi=110,psi=0,theta=70},
+  dot/.style={circle,inner sep=1pt,fill}]
+ \draw[-stealth] (0,0,0) -- (3,0,0) node[pos=1.1]{$x$};
+ \draw[-stealth] (0,0,0) -- (0,3,0) node[pos=1.1]{$y$};
+ \draw[-stealth] (0,0,0) -- (0,0,3) node[pos=1.1]{$z$};
+ \path (2,0,0) coordinate (A) (0,2,0) coordinate (B)
+  (0,0,2) coordinate (C) (2/3,2/3,2/3) coordinate (I);
+ \draw[gray] (A) -- (B) -- (C) -- cycle;
+ \begin{scope}[3d/install local frame={origin=(I),
+   ex=(B)-(A),ey=(C)-(A),orthonormalize,name=tilted}]
+  \draw[blue] (0,0) circle[radius=0.8];
+  \draw[blue] (-.5,-.5) -- (.5,-.5) -- (.5,.5)
+   -- (-.5,.5) -- cycle;
+  \draw[-stealth] (0,0,0) -- (0,0,1) node[above]{$\vec n$};
+  \begin{scope}[canvas is xy plane at z=0,transform shape]
+   \node[blue] at (0,-0.6) {\tiny tilted};
+  \end{scope}
+  \path (0.8,0) coordinate[dot,label=right:$P$] (P);
+ \end{scope}
+\end{tikzpicture}
+\end{codeexample}
+
+Inside the picture, |TD("(P)")| yields the main coordinates of $P$ outside
+the local frame and its local coordinates $(0.8,0,0)$ inside it
+(section~\ref{sec:NamedCoordinates}). Outside the picture, as in the next
+example, it yields the coordinates $P$ was defined with, i.e.\ the local ones.
+The following functions convert explicit coordinates between the frames. They use the local frame that is
+in force or, outside of any local frame, the one that was installed last.
+Results are accurate to about $10^{-4}$.
+
+\begin{math-function}{TDtomain("\mvar{vector}")}
+   Yields the main coordinates of a point given in local coordinates.
+\end{math-function}
+
+\begin{math-function}{TDtolocal("\mvar{vector}")}
+   Yields the local coordinates of a point given in main coordinates.
+\end{math-function}
+
+\begin{codeexample}[width=5.6cm,preamble={\usetikzlibrary{3dtools}}]
+\pgfmathsetmacro{\Pmain}{TDtomain("(P)")}%
+\pgfmathsetmacro{\Iloc}{TDtolocal("(I)")}%
+\pgfmathsetmacro{\Aloc}{TDtolocal("(A)")}%
+\def\ppv#1{(\pgfmathprintvector[/pgf/number format/fixed]{#1})}%
+$\begin{array}{l}
+\vec P_\mathrm{main}=\ppv{\Pmain},\\
+\vec I_\mathrm{loc}=\ppv{\Iloc},\\
+\vec A_\mathrm{loc}=\ppv{\Aloc}
+\end{array}$
+\end{codeexample}
+
+Pics work in local frames, too. Here a flag pic, which is drawn in its own $xy$
+plane, gets placed at six positions on a circle.
+
+\begin{codeexample}[width=5cm,preamble={\usetikzlibrary{3dtools}}]
+\begin{tikzpicture}[3d/install view={phi=120,psi=0,theta=65},
+ pics/flag/.style={code={\draw[thick] (0,0) -- (0,1.3);
+   \draw[fill=yellow!60] (0,0.7) -- (0.8,0.7) -- (0.8,1.25)
+    -- (0,1.25) -- cycle;}}]
+ \draw (0,0,0) circle[radius=1.5];
+ \foreach \a in {0,60,...,300}
+ {\begin{scope}[3d/install local frame={
+    origin={({1.5*cos(\a)},{1.5*sin(\a)},0)},
+    ex={({cos(\a)},{sin(\a)},0)},ey={(0,0,1)}}]
+   \pic{flag};
+  \end{scope}}
+\end{tikzpicture}
+\end{codeexample}
 
 \subsection{Visibility considerations}
 
@@ -894,6 +1076,84 @@ surface with \LaTeX.
 There are some special cases that may be of particular interest: $R'(u)=0$ for a
 cylinder and $R'(u)=-r/h$ for a cone of height $h$ and base radius $r$. 
 
+\subsection{Automatic occlusion}
+\label{sec:Scenes}
+
+TikZ paints in the order in which paths are given. Inside a scene, the
+library reorders them instead: every path becomes a \emph{piece}, its output is
+put aside while TikZ builds it, and at the end of the scene the pieces are
+painted from back to front (painter's algorithm). The depth of a piece is the
+mean depth of the points the path visits (section~\ref{sec:NamedCoordinates}).
+The pics |cylinder|, |3d/frustum|, |3d/cone|, |3d/shaded cone|, |3d/circle|
+and |3d/circle on sphere| split themselves into pieces (the rim behind, the
+front half of the mantle, the cap, the arcs in front and behind), each with the
+depth of its centroid, so that, e.g., a ring around a cylinder passes behind
+it and in front of it. Faces of polyhedra are paths, so they are pieces, too.
+
+A straight path whose depth varies (an axis, a beam) is cut where it passes
+other pieces (at their depths), and each run is painted at its own depth, so it
+can pass through them (key |3d/split|). Pieces of equal depth, like the
+coplanar caps of nested cylinders, are painted larger first. A |3d/sphere|
+places the pieces around it: what is inside stays between its back and front
+shells, what lies on its surface (points, the arcs of
+|3d/circle on sphere|) goes just in front of the shell it lies on, in the
+order of the code, and what is outside goes behind or in front of the whole
+sphere. In a scene the hidden edges
+of the pics are drawn like visible ones: an opaque surface covers them, a
+translucent one tints them.
+
+This is a heuristic, not hidden surface removal. Each piece gets a single
+depth, so curved pieces that interpenetrate may get the wrong order; set the
+depth by hand with |3d/depth| where needed. A circle drawn with the |circle|
+path operation is a single piece at the depth of its center; use the pic
+|3d/circle| for rings that wrap around other objects, and |3d/sphere| for a
+sphere with things inside. Translucent fills keep working.
+
+\begin{key}{/tikz/3d/scene}
+	Turns the current scope (or picture) into a scene. Nested scenes belong to
+	the outermost one. A piece goes to the layer that was active when the path
+	started. The line width, dash pattern, colors, opacity, line cap and join
+	set by scopes inside the scene are restored in every piece; clips and
+	transparency groups of such scopes are not, and should be put on the paths
+	(or around the scene). Paths that visit no point with a known depth, like a
+	lone node at a named coordinate, are painted in front.
+\end{key}
+
+\begin{key}{/tikz/3d/split=\meta{length} (initially 0.2mm)}
+	A path whose points lie on a straight line, that does not fill, and whose
+	depth varies by more than \meta{length} is cut where it passes other pieces
+	(the runs are clipped copies of the same drawing, overlapping by 0.25pt).
+	|0| switches this off.
+\end{key}
+
+\begin{key}{/tikz/3d/edge only}
+	Removes the fill, the shading and the path picture of a path. The pics
+	add it to |3d/hidden|, so the style of a surface can be reused for its
+	hidden edges.
+\end{key}
+
+\begin{key}{/tikz/3d/depth=\meta{depth}}
+	Sets the depth of the pieces of the current path or scope. \meta{depth} is
+	|front|, |back|, or a coordinate in parentheses whose depth is used, e.g.\
+	|3d/depth={(0,0,1)}|.
+\end{key}
+
+\begin{codeexample}[width=6cm,preamble={\usetikzlibrary{3dtools}}]
+\begin{tikzpicture}[3d/install view={phi=20,theta=70},
+  3d/scene]
+ % the rings come first in the code
+ \foreach \z in {0.6,1.8}
+  \pic[orange,ultra thick] at (0,0,\z) {3d/circle={r=1}};
+ \pic {cylinder={r=0.5,h=2.4,
+  cylinder/mantle/.style={fill=cyan!20,fill opacity=0.5,draw},
+  cylinder/top/.style={fill=cyan!20,fill opacity=0.5,draw}}};
+ \pic at (2.5,0,0) {3d/frustum={R=1,r=0.3,h=1.5,
+  frustum/inner/.style={fill=yellow!70,fill opacity=0.7},
+  frustum/outer/.style={fill=yellow!40,fill opacity=0.4}}};
+ \draw[red,thick,->] (2.5,0,-0.5) -- (2.5,0,2.2);
+\end{tikzpicture}
+\end{codeexample}
+
 \subsection{``Physical'' coordinates}
 \label{sec:PhysicalCoordinates}
 
@@ -904,14 +1164,23 @@ this. It should be said, though, that these functions are even more
 apart from the ``physical'' $x$ and $y$ coordinates, i.e.\ the coordinates of an
 point on the screen, one can also keep track of the physical $z$ coordinate, or
 screen depth, which indicates how far a given point is above  ($z>0$) or below
-($z<0$) the screen. To accomplish this, one needs to switch on the recording of
-physical components.
+($z<0$) the screen. The physical components of every named node and coordinate
+are recorded (section~\ref{sec:NamedCoordinates}).
 
 \begin{key}{/tikz/3d/record physical components}
-        Switches on recording of physical components of coordinates.
+        Does nothing; kept for compatibility. Earlier versions needed it to
+        switch on the recording.
 \end{key}
 
-The physical components can then be retrieved with various functions.
+The physical components of a point are its $x$ and $y$ coordinates on the
+canvas, in |cm|, and its screen depth $\vec n\cdot\vec P$, where $\vec P$ are the
+main coordinates of the point (section~\ref{sec:LocalFrames}) and $\vec n$ is the
+normal on the screen of the main frame (cf.\ |nscreenx| etc.). For views
+installed with |3d/install view| this means that the physical components are
+$O(\phi,\psi,\theta)\cdot\vec P$ of \eqref{eq:O3}, plus the canvas shift of the
+main frame. The rules for the depth are those of
+section~\ref{sec:NamedCoordinates}; if the depth of a coordinate is not known,
+|TDphysz| warns and yields 0. The physical components can then be retrieved with various functions.
 
 \begin{math-function}{TDphysx("\mvar{vector}")}
    Yields the physical $x$-component of a 3d named coordinate.
@@ -930,8 +1199,13 @@ The physical components can then be retrieved with various functions.
    coordinate.
 \end{math-function}
 
-Sometimes one may want to retrieve the components of a physical coordinate in a
-local frame.
+Sometimes one may want to retrieve the components of a physical coordinate in
+another frame, i.e.\ the coordinates of a point that has been defined in one
+frame with respect to the frame that is in force now. These functions invert
+the map from coordinates to physical components exactly, so they work for any
+non-degenerate view and local frame. Shifts are taken into account; other
+transformations, e.g.\ |scale|, should be the same as when the point was
+recorded.
 
 \begin{math-function}{TDlocalx("\mvar{vector}")}
    Yields the local $x$-component of a 3d named coordinate the physical
@@ -953,27 +1227,31 @@ local frame.
    coordinate the physical coordinates of which have been recorded.
 \end{math-function}
 
+In the following example, $B$, $C$ and $D$ are defined at $(3,0,0)$ in views
+that are rotated by $\phi=30^\circ$, $150^\circ$ and $270^\circ$, respectively.
+|TDlocal|, evaluated in the unrotated view, yields their coordinates in this view.
+
 \begin{codeexample}[width=5.2cm,preamble={\usetikzlibrary{3dtools}}]
 \begin{tikzpicture}[3d/record physical components,
-	dot/.style={circle,inner sep=1pt,fill}] 
- \begin{scope}[3d/install view={phi=0,psi=0,theta=70}]	
+	dot/.style={circle,inner sep=1pt,fill}]
+ \begin{scope}[3d/install view={phi=0,psi=0,theta=70}]
   \path (0,0,3) coordinate (A);
   \path[3d/install view={phi=30}] (3,0,0) coordinate (B);
   \path[3d/install view={phi=150}] (3,0,0) coordinate (C);
   \path[3d/install view={phi=270}] (3,0,0) coordinate (D);
- \end{scope}
- \draw[dashed] foreach \X [remember=\X as \Y (initially D)]
+  \draw[dashed] foreach \X [remember=\X as \Y (initially D)]
  	in {B,C,D}
-  {(A) -- (\X) (\Y) -- (\X) 
- coordinate[dot,label=below:{$\begin{aligned}
+   {(A) -- (\X) (\Y) -- (\X)
+  coordinate[dot,label=below:{$\begin{aligned}
 	\X_\mathrm{phys}&=\pgfmathparse{TDphys("\X")}%
- (\pgfmathprintvector\pgfmathresult)^T\\
+  (\pgfmathprintvector[/pgf/number format/fixed]\pgfmathresult)^T\\
 	\X_\mathrm{loc}&=\pgfmathparse{TDlocal("\X")}%
- (\pgfmathprintvector\pgfmathresult)^T\\
- \end{aligned}$}]}
- (A) coordinate[dot,label=above:{$A=\pgfmathparse{TDphys("A")}%
- (\pgfmathprintvector\pgfmathresult)^T
- $}]; 
+  (\pgfmathprintvector[/pgf/number format/fixed]\pgfmathresult)^T\\
+  \end{aligned}$}]}
+  (A) coordinate[dot,label=above:{$A=\pgfmathparse{TDphys("A")}%
+  (\pgfmathprintvector\pgfmathresult)^T
+  $}];
+ \end{scope}
 \end{tikzpicture}
 \end{codeexample}
 
@@ -992,10 +1270,18 @@ d_\mathrm{phys}(\vec A,\vec B)=%
 \end{array}$
 \end{codeexample}
 
-These are the things that work. However, there are, unfortunately, more than
-enough things that do not work. They include shifted frames, other coordinate
-systems such as spherical ones, all coordinates that are defined in 
-|canvas is xy plane at z=0| or relatives, etc.
+\begin{key}{/tikz/3d/install dual basis}
+		Defines the coordinates |(dualex)|, |(dualey)| and |(dualez)| (the names
+		are stored in the keys |/tikz/3d/dual ex| etc.) such that the local
+		components are the scalar products of these vectors with the physical
+		components measured from the origin of the frame in force. For
+		orthonormal views and frames, they are the physical components of the
+		basis vectors.
+\end{key}
+
+Section~\ref{sec:NamedCoordinates} lists the constructions through which the
+depth cannot be tracked, e.g.\ |canvas is xy plane at z=0| (use a local frame
+instead).
 
 \subsection{Predefined path constructions and pics}
 
@@ -1153,16 +1439,17 @@ systems such as spherical ones, all coordinates that are defined in
 \end{codeexample}
 
 \begin{key}{/tikz/pics/3d/circle on sphere=\meta{options} (initially empty)}
-		Draws a circle on as sphere. It distinguishes between foreground and
-		background. Notice that this pic defines its own dreibein, so it will
-		define coordinates that draw their names from |/tikz/3d/aux keys/ex|,
-		|/tikz/3d/aux keys/ey| and |/tikz/3d/aux keys/ez|. It will also define a
-		coordinate |(nscreen)| which contains the normal to the screen.  The
-		foreground path will use the style |/tikz/3d/visible|, and the hidden
-		path will be drawn with the style |/tikz/3d/hidden|. For an alternative
-		approach with more functionality see the 
+		Draws a circle (or an arc) on a sphere. It distinguishes between
+		foreground and background. Notice that this pic defines its own
+		dreibein, so it will define coordinates that draw their names from
+		|/tikz/3d/aux keys/ex|, |/tikz/3d/aux keys/ey| and
+		|/tikz/3d/aux keys/ez|. It will also define a coordinate |(nscreen)|
+		which contains the normal to the screen.  The foreground path will use
+		the style |/tikz/3d/visible|, and the hidden path will be drawn with the
+		style |/tikz/3d/hidden|. The commands of the
 		\href{https://github.com/matthias-wolff/tikz-3dplot-circleofsphere}{%
-		\texttt{tikz-3dplot-circleofsphere}} package.
+		\texttt{tikz-3dplot-circleofsphere}} package are available through the
+		library |3dtools.circleofsphere| (section~\ref{sec:CircleOfSphere}).
 \end{key}
 \begin{key}{/tikz/3d/circle on sphere/C (initially {(0,0,0)})}
         Coordinate of the center of the sphere.
@@ -1187,6 +1474,48 @@ systems such as spherical ones, all coordinates that are defined in
 \begin{key}{/tikz/3d/circle on sphere/back layer=\meta{layer} (initially main)}
  		Layer of the hidden faces.
 \end{key}
+\begin{key}{/tikz/3d/circle on sphere/latitude=\meta{angle} (initially empty)}
+		The latitude circle at \meta{angle}: sets |n| to $(0,0,1)$ and |P| to
+		|C| shifted by $R\sin(\text{\meta{angle}})$ along $z$.
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/longitude=\meta{angle} (initially empty)}
+		The meridian at the azimuth \meta{angle}: the great circle through the
+		poles and the direction $(\cos\text{\meta{angle}},\sin\text{\meta{angle}},0)$.
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/fill (initially empty)}
+		Style of the disk of the circle, which is painted first, e.g.\
+		|fill/.style={fill=red,fill opacity=0.2}|.
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/start angle=\meta{angle} (initially 0)}
+		Start of the arc. Angles are measured in the plane of the circle from
+		the projection of |u|, positively around |n|. The arc gets split where
+		it passes from the front of the sphere to the back.
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/end angle=\meta{angle} (initially 360)}
+		End of the arc.
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/u (initially {(1,0,0)})}
+		Direction of the angle 0 (it gets projected into the plane of the circle).
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/start color=\meta{color} (initially empty)}
+		If set, the arc gets a color gradient from \meta{color} at its start to
+		|end color| at its end. It is drawn as sub-arcs of at most
+		|segment angle| degrees, each with its own color and, in a scene, its own
+		depth. Only the last sub-arc keeps the arrow tips, so put an end tip
+		(e.g.\ |->|) in the styles of the parts.
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/end color=\meta{color} (initially empty)}
+		Color at the end of the arc (initially the start color).
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/segment angle=\meta{angle} (initially 360)}
+		In a scene, the arc is painted as cells of at most this angle (on a
+		grid that starts at the point closest to the viewer), each with the
+		depth of its centroid. Sub-arcs of 1pt or more get round caps, which
+		close their joints.
+\end{key}
+\begin{key}{/tikz/3d/circle on sphere/gradient angle=\meta{angle} (initially 2)}
+		Largest angle of a sub-arc of a color gradient.
+\end{key}
 
 \begin{codeexample}[width=4.5cm,preamble={\usetikzlibrary{3dtools}}]
 \begin{tikzpicture}[3d/install view={phi=110,theta=70},
@@ -1195,6 +1524,75 @@ systems such as spherical ones, all coordinates that are defined in
  \path pic{3d/circle on sphere={R=R,P={(0.5,-1.2,1)}}};
 \end{tikzpicture}
 \end{codeexample}
+
+\begin{codeexample}[width=4.5cm,preamble={\usetikzlibrary{3dtools}}]
+\begin{tikzpicture}[3d/install view={phi=110,theta=70},
+	declare function={R=2;}]
+ \shade[ball color=white,3d/screen coords,opacity=0.5]
+   circle[radius=R];
+ \path pic{3d/circle on sphere={R=R,latitude=30,
+     fill/.style={fill=red,fill opacity=0.2}}}
+   pic{3d/circle on sphere={R=R,longitude=40}}
+   pic{3d/circle on sphere={R=R,n={(1,1,0)},end angle=270,
+     start color=blue,end color=red,
+     /tikz/3d/visible/.style={thick,->},
+     /tikz/3d/hidden/.style={thick,->,opacity=0.4}}};
+\end{tikzpicture}
+\end{codeexample}
+
+\begin{key}{/tikz/pics/3d/sphere=\meta{options} (initially empty)}
+		A sphere of radius |R| around the pic position, painted with the style
+		|shell| and outlined with |outline|. In a scene the shell is painted
+		twice, behind and in front of everything inside the sphere, and the
+		visible parts of |3d/circle on sphere| go on top of it; for a
+		translucent sphere, the opacity of |shell| applies to each layer.
+\end{key}
+\begin{key}{/tikz/3d/sphere/R (initially 1)}
+		Radius.
+\end{key}
+\begin{key}{/tikz/3d/sphere/shell (initially {ball color=white})}
+		Style of the shell.
+\end{key}
+\begin{key}{/tikz/3d/sphere/outline (initially draw)}
+		Style of the outline.
+\end{key}
+
+\begin{key}{/tikz/pics/3d/point on sphere=\meta{options} (initially empty)}
+		Puts a node at the point |P| on the sphere around |C|, with the style
+		|front| and the text |front text| if the point faces the viewer, and
+		with |back| and |back text| otherwise.
+\end{key}
+\begin{key}{/tikz/3d/point on sphere/C (initially {(0,0,0)})}
+		Center of the sphere.
+\end{key}
+\begin{key}{/tikz/3d/point on sphere/P (initially {(0,0,1)})}
+		The point.
+\end{key}
+\begin{key}{/tikz/3d/point on sphere/front text (initially \textbackslash textbullet)}
+		Text of the node on the front.
+\end{key}
+\begin{key}{/tikz/3d/point on sphere/back text (initially \textbackslash(\textbackslash circ\textbackslash))}
+		Text of the node on the back.
+\end{key}
+
+\begin{key}{/tikz/pics/3d/circle=\meta{options} (initially empty)}
+		A circle (or an arc) around the position of the pic, split into the
+		half that is closer to the viewer, drawn with |front|, and the other
+		half, drawn with |back|. In a scene (section~\ref{sec:Scenes}) the
+		halves are separate pieces, so the circle can wrap around other
+		objects. The keys |n|, |u|, |start angle|, |end angle|, |fill|,
+		|start color|, |end color|, |segment angle| and |gradient angle| work
+		as for |3d/circle on sphere|.
+\end{key}
+\begin{key}{/tikz/3d/circle/r (initially 1)}
+		Radius.
+\end{key}
+\begin{key}{/tikz/3d/circle/front (initially empty)}
+		Style of the half closer to the viewer.
+\end{key}
+\begin{key}{/tikz/3d/circle/back (initially empty)}
+		Style of the other half.
+\end{key}
 
 \begin{key}{/tikz/pics/3d incircle=\meta{options} (initially empty)}
         Inscribes a circle in a triangle in 3 dimensions.
@@ -1248,13 +1646,37 @@ systems such as spherical ones, all coordinates that are defined in
  		Coordinate inside the polyhedron.
 \end{key}
 
-\begin{key}{/tikz/3d/polyhedron/L=\meta{coordinate} (initially {(1,1,1)})}
- 		Coordinate of light source.
+\begin{key}{/tikz/3d/polyhedron/L=\meta{vector} (initially the value of |3d/light|)}
+ 		Direction towards the light, used for the faces of polyhedra only.
+		By default it follows |/tikz/3d/light|.
 \end{key}
 
 \begin{key}{/tikz/3d/polyhedron/shading function=\meta{name} (initially tikztdpolyhedronshade)}
- 		Function of the projection of the light source on the normal of the
-		respective face that determines the shading.
+ 		Function of the cosine between the outward normal of the face and
+		the light direction. It returns the percentage of the face color
+		that is mixed with black. The default,
+		|tikztdpolyhedronshade(\x)=100*tikztdlight(\x)|, uses the lighting
+		model below. The look of earlier versions is obtained with
+		|declare function={tikztdpolyhedronshade(\x)=70+30*\x;}|.
+\end{key}
+
+\begin{key}{/tikz/3d/light=\meta{vector} (initially {(1,1,1)})}
+		Direction pointing towards a single directional light, in the
+		coordinates in which the drawing is specified (the frame of
+		|3d/install view|). The light is thus fixed in the scene: changing the
+		view changes what is lit as seen from the camera. It is used by
+		polyhedra, |cylinder|, |ycylinder| and |3d/shaded cone|. A surface
+		element with unit outward normal $n$ and the unit light direction $L$
+		gets the intensity
+		$I=\min\bigl(1,a+d\max(0,n\cdot L)\bigr)$ (Lambert), and the color
+		\meta{color}|!|$100I$|!black|. The pgf function |tikztdlight| computes
+		$I$ from $n\cdot L$.
+\end{key}
+\begin{key}{/tikz/3d/light/ambient=\meta{number} (initially 0.5)}
+		The ambient part $a$.
+\end{key}
+\begin{key}{/tikz/3d/light/diffuse=\meta{number} (initially 0.5)}
+		The diffuse part $d$.
 \end{key}
 
 
@@ -1391,14 +1813,59 @@ cylinders. They share a couple of common keys.
 \end{key}
 
 \begin{key}{/tikz/pics/3d/cone (initially empty)}
- Draws a cone with the basis in the current xy plane.
+ Draws a cone whose base, of radius |r|, is centered at the pic position and
+ whose apex sits at distance |h| along |3d/cone/axis|. The pic defines the
+ coordinates |-base|, |-apex| and, for compatibility, |-tip| (same as |-apex|).
+ Hidden parts of the base rim are drawn with |3d/hidden|.
+\end{key}
+\begin{key}{/tikz/3d/cone/axis (initially {(0,0,1)})}
+ Direction of the cone axis (it gets normalized). Also used by |3d/frustum|.
+\end{key}
+\begin{key}{/tikz/3d/cone/apex=\meta{3d vector}}
+ Apex relative to the base center. Sets |3d/cone/axis| and |3d/h|.
+\end{key}
+\begin{key}{/tikz/3d/cone/outer (initially empty)}
+ Style of the visible part of the mantle, e.g.\ |fill=red!30|.
+\end{key}
+\begin{key}{/tikz/3d/cone/inner (initially empty)}
+ Style of the base region when the base side faces the viewer (the base disk,
+ or the interior of an open cone).
+\end{key}
+\begin{key}{/tikz/3d/cone/outer shade (initially 3d/cone/lit side=outer)}
+ Shading of the mantle used by |3d/shaded cone|. It is centered at the apex.
+ By default the mantle is lit by |3d/light|.
+\end{key}
+\begin{key}{/tikz/3d/cone/inner shade (initially 3d/cone/lit side=inner)}
+ Shading of the base region (the interior of the open cone) used by
+ |3d/shaded cone|, lit by |3d/light|.
+\end{key}
+\begin{key}{/tikz/3d/cone/color=\meta{color} (initially white)}
+ Color of the lit cone.
+\end{key}
+\begin{key}{/tikz/3d/cone/lit side=\meta{outer or inner}}
+ Sets |3d/cone/lit/max| and |3d/cone/lit/min| to the intensities of the
+ brightest and darkest visible generator of that side and calls
+ |3d/cone/light shading| with the screen angle, seen from the apex, of the
+ brightest generator.
+\end{key}
+\begin{key}{/tikz/3d/cone/light shading=\meta{angle}}
+ The shading hook. The default declares a functional shading in the angle
+ around the apex that reproduces the exact Lambert intensity of every visible
+ generator (brightness is constant along a generator). Replace it to use
+ a different shading, e.g.\ one built from \meta{angle} and the two keys above.
+\end{key}
+\begin{key}{/tikz/3d/cone/screen angle}
+ Set by the cone pics before the shading styles are used: the screen angle of
+ the direction from the base center to the apex. For instance,
+ |outer shade/.style={3d/cone shading={alpha/.evaluated={\pgfkeysvalueof{/tikz/3d/cone/screen angle}-90}}}|
+ rotates the shading with the cone.
 \end{key}
 
 \begin{key}{/tikz/pics/3d/shaded cone (initially empty)}
  Draws a shaded cone with the basis in the current xy plane.
 \end{key}
 
-\begin{key}{/tikz/pics/3d/cone/shading (initially empty)}
+\begin{key}{/tikz/3d/cone shading=\meta{options}}
  Defines and uses a functional shading that can be used for cones. The
  parameters are the coordinates of the tip |x| and |y|, which have to satisfy
  $-25<x,y<25$, and |alpha|, which indicates the rotation of the shading.
@@ -1415,8 +1882,19 @@ cylinders. They share a couple of common keys.
 
 
 \begin{key}{/tikz/pics/3d/frustum (initially empty)}
- Draws a frustum with the basis in the current xy plane. Notice that if both
- radii are equal this is just a cylinder.
+ Draws a frustum with the basis in the current xy plane, open at both ends.
+ The generatrices of the silhouette divide the mantle in two patches: one
+ shows its outer side to the viewer, painted with |3d/frustum/outer|, the
+ other its inner side, painted with |3d/frustum/inner|. The rims and the
+ generatrices are drawn with |3d/visible| and |3d/hidden|. Notice that if
+ both radii are equal this is just a cylinder.
+\end{key}
+\begin{key}{/tikz/3d/frustum/outer (initially empty)}
+ Style of the patch of the mantle that shows its outer side.
+\end{key}
+\begin{key}{/tikz/3d/frustum/inner (initially empty)}
+ Style of the patch of the mantle that shows its inner side, e.g.\ the
+ coating of a conical mirror.
 \end{key}
 
 
@@ -1437,17 +1915,39 @@ cylinders. They share a couple of common keys.
 \begin{key}{/tikz/pics/cylinder (initially empty)}
 	A cylinder with an arbitrary axis. 
 	This pic requires the |calc| library. 
+	Seen along its axis it reduces to the cap facing the viewer.
 \end{key}
    
 \begin{key}{/tikz/pics/3d/cylinder/axis (initially {(0,0,1)})}
 	Axis of cylinder.
 \end{key}
    
-\begin{key}{/tikz/pics/3d/cylinder/mantle (initially empty)}
- Style for cylinder mantle. If no fill option is specified, it will be shaded.
+\begin{key}{/tikz/pics/3d/cylinder/mantle (initially draw)}
+ Style for cylinder mantle. If it contains no fill or shading, the mantle
+ shows the lighting of |3d/cylinder/lighting|. A user shading (e.g.\
+ |left color|, |right color|, |middle color|) is oriented across the axis.
+\end{key}
+\begin{key}{/tikz/3d/cylinder/color=\meta{color} (initially white)}
+ Color of the lit mantle and caps.
+\end{key}
+\begin{key}{/tikz/3d/cylinder/lighting (initially a path picture with the lit shading)}
+ Painted below the mantle and the cap styles. In parallel projection the
+ Lambert intensity of the mantle only depends on the position across the
+ silhouette, so the default axial shading is exact. A cap is flat: the
+ visible one, with outward normal $n=\pm$axis, gets the constant intensity
+ $\min\bigl(1,a+d\max(0,n\cdot L)\bigr)$. It is not painted below a
+ mantle or cap whose style fills or shades. Set it to |{}| to switch the
+ lighting of mantle and caps off.
+\end{key}
+\begin{key}{/tikz/3d/cylinder/hole=\meta{radius} (initially 0)}
+	Radius of a hole in the caps.
+\end{key}
+\begin{key}{/tikz/3d/cylinder/open=\meta{boolean} (initially false)}
+	A tube without caps: only the rim of the cap facing the viewer is drawn.
 \end{key}
 \begin{key}{/tikz/pics/3d/cylinder/top (initially draw)}
- Style for cylinder top. 
+ Style for the visible cap (top or bottom, also used by |ycylinder|). If it
+ contains no fill, the cap shows the lighting of |3d/cylinder/lighting|.
 \end{key}
 
 
@@ -1457,6 +1957,17 @@ cylinders. They share a couple of common keys.
  \pic{cylinder={r=0.4,h=3,
  cylinder/axis={(1,0,1)},
  cylinder/top/.style={fill=blue}}};
+\end{tikzpicture}
+\end{codeexample}
+
+\begin{codeexample}[width=5cm,preamble={\usetikzlibrary{calc,3dtools}}]
+\begin{tikzpicture}[3d/install view={phi=110,psi=0,theta=70},
+  3d/light={(-1,0.3,0.5)},3d/cylinder/color=teal!60,
+  3d/cone/color=orange]
+ \pic{cylinder={r=0.6,h=2}};
+ \begin{scope}[xshift=2.5cm]
+  \pic{3d/shaded cone={r=1,h=2}};
+ \end{scope}
 \end{tikzpicture}
 \end{codeexample}
 
@@ -1548,7 +2059,7 @@ need to load the library.
 		|--| at the beginning. This may be necessary to patch paths together.
 \end{key}
 
-\begin{key}{/tikz/stored path/restore reversed path=\meta{name} (initially empty)}
+\begin{key}{/tikz/stored path/append reversed path=\meta{name} (initially empty)}
 		Restores a saved path of name \meta{name} using the |insert path| key in
 		\emph{reversed} order with a |--| at the beginning. This may be necessary to
 		patch paths together.
@@ -1769,6 +2280,43 @@ decorate] (5,3.5) circle[radius=3cm];
 \end{codeexample}
 
 
+\subsection{Circles of a sphere (compatibility library)}
+\label{sec:CircleOfSphere}
+
+|\usetikzlibrary{3dtools.circleofsphere}| provides the commands of the
+\href{https://github.com/matthias-wolff/tikz-3dplot-circleofsphere}{%
+\texttt{tikz-3dplot-circleofsphere}} package by Matthias Wolff, drawn with
+|3d/circle on sphere| and |3d/point on sphere|, so they work with any view and
+inside scenes. Load it instead of the package. The styles |tdplotCsFront|,
+|tdplotCsBack|, |tdplotCsFill|, |tdplotPtFront| and |tdplotPtBack| keep their
+meaning; |tdplotCsDrawAux| is not supported.
+|\tdplotCsComputeTransformRotScreen| needs |tikz-3dplot|.
+
+\begin{command}{\tdplotCsDrawCircle\oarg{style}\marg{radius}\marg{alpha}\marg{beta}\marg{elevation}}
+	The circle whose plane has the normal with azimuth \meta{alpha} and polar
+	angle \meta{beta}, at the elevation angle \meta{elevation} above the center.
+	The circle is filled only if \meta{style} mentions |tdplotCsFill|.
+\end{command}
+\begin{command}{\tdplotCsDrawGreatCircle\oarg{style}\marg{radius}\marg{alpha}\marg{beta}}
+\end{command}
+\begin{command}{\tdplotCsDrawLatCircle\oarg{style}\marg{radius}\marg{latitude}}
+\end{command}
+\begin{command}{\tdplotCsDrawLonCircle\oarg{style}\marg{radius}\marg{alpha}}
+\end{command}
+\begin{command}{\tdplotCsDrawPoint\oarg{style}\marg{radius}\marg{alpha}\marg{beta}}
+\end{command}
+
+\begin{codeexample}[width=4.5cm,preamble={\usetikzlibrary{3dtools.circleofsphere}}]
+\begin{tikzpicture}[3d/install view={phi=110,theta=70},
+  tdplotCsBack/.style={densely dashed,gray}]
+ \shade[ball color=white,3d/screen coords,opacity=0.5]
+   circle[radius=2];
+ \foreach \a in {-60,-30,...,60} {\tdplotCsDrawLatCircle{2}{\a}}
+ \foreach \a in {0,30,...,150} {\tdplotCsDrawLonCircle{2}{\a}}
+ \tdplotCsDrawPoint{2}{30}{60}
+\end{tikzpicture}
+\end{codeexample}
+
 \subsection{Remarks on the implementation}
 
 When the library gets loaded, the version of \tikzname\ gets checked. If the
@@ -1776,6 +2324,12 @@ version is earlier than 3.1.1, a warning is issued. In this case, one cannot use
 the library unless one updates the pgf installation. Notice that many features
 of this library depend on \tikzname's internal macro |\tikz@dcl@coord@|. If this
 macro gets removed or changed, many features of the library will no longer work.
+The tracking of depths (section~\ref{sec:NamedCoordinates}) wraps
+|\pgfpointxyz|, |\pgfpointxy|, |\pgfpointpolarxy|, |\pgfsetxvec| and its
+relatives, the |shift| key and several internal macros of \tikzname\ and of its
+|calc| library (the current point, named coordinates, node placement, and the
+|($...$)| parser). It costs about 1--2\,\% of the run time of pictures that
+consist of many plain 2d paths and nodes.
 So this whole setup is fragile. Of course, this complication is not unheard of,
 but it might be important to know about this before deciding to use this
 library. 

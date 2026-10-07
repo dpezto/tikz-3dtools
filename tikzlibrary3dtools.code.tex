@@ -7,8 +7,7 @@
 %
 % See the file doc/generic/pgf/licenses/LICENSE for more details.
 \ProvidesFileRCS{tikzlibrary3dtools.code.tex}
-\usetikzlibrary{3d,decorations,fpu}% to do: ability to switch on and off
-\usepackage{calculator}% maybe drop
+\usetikzlibrary{3d,calc,decorations,fpu}% to do: ability to switch on and off
 \makeatletter%
 \ifnum\month>10\relax
 \typeout{Hibernation season has just started.}%
@@ -97,7 +96,449 @@ install view/.style={/utils/exec=\tikzset{3d/.cd,#1}%
 \pgfmathsetmacro#1{#2}%
 \pgfmathsmuggle#1\endgroup}%
 %
-\xdef\tikz@td@type{0}%0=linear combination,1=vector product
+% ---------------------------------------------------------------------------
+% Numeric back end (expl3/l3fp, l3sort). Requires the LaTeX kernel >= 2020-02
+% (expl3 preloaded); the library is LaTeX-only anyway (\newcommand, \newcounter,
+% \PackageWarning, \begin{scope}, ...). Public pgfmath names, the TD
+% mini-language and all keys are unchanged.
+\ExplSyntaxOn
+\scan_new:N \s__tdtools_stop
+\scan_new:N \s__tdtools_mark
+\fp_new:N \l__tdtools_ax_fp \fp_new:N \l__tdtools_ay_fp \fp_new:N \l__tdtools_az_fp
+\fp_new:N \l__tdtools_bx_fp \fp_new:N \l__tdtools_by_fp \fp_new:N \l__tdtools_bz_fp
+\fp_new:N \l__tdtools_cx_fp \fp_new:N \l__tdtools_cy_fp \fp_new:N \l__tdtools_cz_fp
+\fp_new:N \l__tdtools_rx_fp \fp_new:N \l__tdtools_ry_fp \fp_new:N \l__tdtools_rz_fp
+\fp_new:N \l__tdtools_rs_fp
+\fp_new:N \l__tdtools_f_fp
+\fp_new:N \l__tdtools_t_fp
+\int_new:N \l__tdtools_type_int
+\tl_new:N \l__tdtools_tmp_tl
+\tl_new:N \l__tdtools_c_tl
+\tl_new:N \l__tdtools_result_tl
+\seq_new:N \l__tdtools_comp_seq
+\clist_new:N \l__tdtools_tmp_clist
+\fp_const:Nn \c__tdtools_cm_fp { \dim_to_fp:n { 1cm } }
+\fp_const:Nn \c__tdtools_cmsq_fp { \c__tdtools_cm_fp * \c__tdtools_cm_fp }
+\msg_new:nnn { 3dtools } { bad-coordinate }
+  { Cannot~interpret~`(#1)'~as~a~3d~coordinate.~Using~(0,0,0). }
+\msg_new:nnn { 3dtools } { syntax }
+  { Cannot~parse~`#1'~in~TD~expression~(missing~`#2'). }
+\msg_new:nnn { 3dtools } { trailing }
+  { Ignoring~unparsed~material~`#1'~in~TD~expression. }
+% ---------------------------------------------------------------------------
+% Numbers. pgfmath hands declared functions either plain decimals or, when the
+% fpu is active, its internal <flag>Y<mantissa>e<exp>] format.
+\cs_new:Npn \__tdtools_num:n #1 { \__tdtools_num:w #1 Y \q_nil Y \q_stop }
+\cs_new:Npn \__tdtools_num:w #1 Y #2 Y #3 \q_stop
+  { \quark_if_nil:nTF {#2} {#1} { \__tdtools_num_float:nw {#1} #2 \q_stop } }
+\cs_new:Npn \__tdtools_num_float:nw #1 #2 ] #3 \q_stop
+  {
+    \int_case:nnF {#1}
+      { {0} {0} {1} {#2} {2} {-#2} {3} {nan} {4} {inf} {5} {-inf} } {nan}
+  }
+\cs_generate_variant:Nn \__tdtools_num:n { V }
+% Evaluate a pgfmath expression into an fp variable. Material made only of
+% digits, spaces and . + - * / ( ) (same syntax and precedence in pgfmath and
+% l3fp) goes straight to l3fp; everything else (pgfmath functions in degrees,
+% units, macros that do not expand to numbers, user-declared functions, ...)
+% still goes through the pgf fpu, exactly as before.
+\cs_new:Npn \__tdtools_class:N #1
+  {
+    \if_int_compare:w `#1 < 48 \exp_stop_f:
+      \if_int_compare:w `#1 < 40 \exp_stop_f:
+        \if_int_compare:w `#1 = 32 \exp_stop_f: \else: X \fi:
+      \else:
+        \if_int_compare:w `#1 = 44 \exp_stop_f: X \fi:
+      \fi:
+    \else:
+      \if_int_compare:w `#1 > 57 \exp_stop_f: X \else: 1 \fi:
+    \fi:
+  }
+% true iff the classified string has a digit and no X
+\cs_new:Npn \__tdtools_if_arith:w #1 X #2 \q_stop
+  { \tl_if_empty:nTF {#2} { \tl_if_empty:nTF {#1} { \use_ii:nn } { \use_i:nn } } { \use_ii:nn } }
+\cs_new_protected:Npn \__tdtools_eval:Nn #1#2
+  {
+    \tl_set:Ne \l__tdtools_tmp_tl {#2}
+    \exp_last_unbraced:Ne \__tdtools_if_arith:w
+      { \exp_args:NV \str_map_function:nN \l__tdtools_tmp_tl \__tdtools_class:N }
+      X \q_stop
+      { \fp_set:Nn #1 { \l__tdtools_tmp_tl } }
+      {
+        \group_begin:
+          \pgfkeys { /pgf/fpu , /pgf/fpu/output~format = float }
+          \pgfmathparse { \l__tdtools_tmp_tl }
+          \exp_args:NNNe
+        \group_end:
+        \fp_set:Nn #1 { \__tdtools_num:V \pgfmathresult }
+      }
+  }
+% ---------------------------------------------------------------------------
+% Coordinates: (x,y), (x,y,z) or (name). Names are resolved recursively
+% (a name may stand for another name); (X) coordinate (X) resolves to (0,0,0);
+% an unknown name gives a warning and (0,0,0). #1 is unused (kept for callers).
+\int_new:N \l__tdtools_depth_int
+\cs_new_protected:Npn \__tdtools_coord:nn #1#2
+  {
+    \tl_set:Ne \l__tdtools_c_tl {#2}
+    \seq_set_split:NnV \l__tdtools_comp_seq { , } \l__tdtools_c_tl
+    \int_case:nnF { \seq_count:N \l__tdtools_comp_seq }
+      {
+        { 1 }
+          {
+            \exp_args:Ne \__tdtools_coord_named:n
+              { \seq_item:Nn \l__tdtools_comp_seq { 1 } }
+          }
+        { 2 }
+          {
+            \seq_pop_left:NN \l__tdtools_comp_seq \l__tdtools_tmp_tl
+            \__tdtools_eval:NV \l__tdtools_cx_fp \l__tdtools_tmp_tl
+            \seq_pop_left:NN \l__tdtools_comp_seq \l__tdtools_tmp_tl
+            \__tdtools_eval:NV \l__tdtools_cy_fp \l__tdtools_tmp_tl
+            \fp_zero:N \l__tdtools_cz_fp
+          }
+        { 3 }
+          {
+            \seq_pop_left:NN \l__tdtools_comp_seq \l__tdtools_tmp_tl
+            \__tdtools_eval:NV \l__tdtools_cx_fp \l__tdtools_tmp_tl
+            \seq_pop_left:NN \l__tdtools_comp_seq \l__tdtools_tmp_tl
+            \__tdtools_eval:NV \l__tdtools_cy_fp \l__tdtools_tmp_tl
+            \seq_pop_left:NN \l__tdtools_comp_seq \l__tdtools_tmp_tl
+            \__tdtools_eval:NV \l__tdtools_cz_fp \l__tdtools_tmp_tl
+          }
+      }
+      {
+        \msg_error:nnn { 3dtools } { bad-coordinate } {#2}
+        \__tdtools_coord_zero:
+      }
+  }
+\cs_generate_variant:Nn \__tdtools_eval:Nn { NV }
+\cs_generate_variant:Nn \seq_set_split:Nnn { NnV }
+\cs_new_protected:Npn \__tdtools_coord_zero:
+  { \fp_zero:N \l__tdtools_cx_fp \fp_zero:N \l__tdtools_cy_fp \fp_zero:N \l__tdtools_cz_fp }
+\cs_new_protected:Npn \__tdtools_coord_unknown:n #1
+  {
+    \PackageWarning{3dtools}{Unknown~coordinate~`#1'.~Using~(0,0,0).}
+    \__tdtools_coord_zero:
+  }
+\cs_new_protected:Npn \__tdtools_coord_named:n #1
+  {
+    \cs_if_exist:cTF { tikz@td@n@ #1 }
+      {
+        \tikz@td@lookup {#1}
+        \int_case:nn { \tikz@td@lkmode }
+          {
+            { 0 } { \__tdtools_coord_text:n {#1} }
+            { 1 }
+              {
+                \clist_set:NV \l__tdtools_tmp_clist \tikz@td@lkv
+                \fp_set:Nn \l__tdtools_cx_fp { \clist_item:Nn \l__tdtools_tmp_clist { 1 } }
+                \fp_set:Nn \l__tdtools_cy_fp { \clist_item:Nn \l__tdtools_tmp_clist { 2 } }
+                \fp_set:Nn \l__tdtools_cz_fp { \clist_item:Nn \l__tdtools_tmp_clist { 3 } }
+              }
+            { 2 } { \tikz@td@unknownwarning {#1} \__tdtools_coord_text:n {#1} }
+          }
+      }
+      { \__tdtools_coord_text:n {#1} }
+  }
+% the text a coordinate was defined with (\tikz@dcl@coord@<name>)
+\cs_new_protected:Npn \__tdtools_coord_text:n #1
+  {
+    \cs_if_exist:cTF { tikz@dcl@coord@ #1 }
+      {
+        \exp_last_unbraced:Nv \__tdtools_coord_named:w { tikz@dcl@coord@ #1 }
+          ( ) \s__tdtools_stop {#1}
+      }
+      { \__tdtools_coord_unknown:n {#1} }
+  }
+\cs_new_protected:Npn \__tdtools_coord_named:w #1 ( #2 ) #3 \s__tdtools_stop #4
+  {
+    \tl_if_blank:nTF {#1}
+      {
+        \tl_if_eq:nnTF {#2} {#4}
+          { \__tdtools_coord_zero: } % (X) coordinate (X)
+          {
+            \int_compare:nNnTF { \l__tdtools_depth_int } > { 64 }
+              { \__tdtools_coord_unknown:n {#4} } % cyclic definitions
+              {
+                \group_begin:
+                  \int_incr:N \l__tdtools_depth_int
+                  \__tdtools_coord:nn { } {#2}
+                  \use:e
+                    {
+                \group_end:
+                      \fp_set:Nn \exp_not:N \l__tdtools_cx_fp { \fp_use:N \l__tdtools_cx_fp }
+                      \fp_set:Nn \exp_not:N \l__tdtools_cy_fp { \fp_use:N \l__tdtools_cy_fp }
+                      \fp_set:Nn \exp_not:N \l__tdtools_cz_fp { \fp_use:N \l__tdtools_cz_fp }
+                    }
+              }
+          }
+      }
+      { \__tdtools_coord_unknown:n {#4} }
+  }
+% ---------------------------------------------------------------------------
+% TD mini-language: same grammar as \pgfmathtdparse (calc-like).
+\cs_new_protected:Npn \__tdtools_parse:n #1
+  {
+    \fp_zero:N \l__tdtools_ax_fp \fp_zero:N \l__tdtools_ay_fp \fp_zero:N \l__tdtools_az_fp
+    \int_zero:N \l__tdtools_type_int
+    \fp_set:Nn \l__tdtools_f_fp { 1 }
+    \__tdtools_dispatch:w + #1 \s__tdtools_mark \s__tdtools_stop
+  }
+% Delimited macros below never scan past the end of the TD string: check that
+% the delimiter #1 occurs before \s__tdtools_stop, else report and stop.
+\cs_new_protected:Npn \__tdtools_guard:nNw #1#2#3 \s__tdtools_stop
+  {
+    \tl_if_in:nnTF {#3} {#1}
+      { #2 #3 \s__tdtools_stop }
+      {
+        \__tdtools_syntax_error:nw {#1} #3
+        \__tdtools_end:w \s__tdtools_mark \s__tdtools_stop
+      }
+  }
+\cs_new_protected:Npn \__tdtools_syntax_error:nw #1#2 \s__tdtools_mark
+  { \msg_error:nnnn { 3dtools } { syntax } {#2} {#1} }
+\cs_new_protected:Npn \__tdtools_dispatch:w
+  {
+    \pgfutil@ifnextchar + \__tdtools_add:w
+      {
+        \pgfutil@ifnextchar - \__tdtools_sub:w
+          {
+            \pgfutil@ifnextchar x \__tdtools_vecprod:w
+              {
+                \pgfutil@ifnextchar o \__tdtools_scalprod:w
+                  {
+                    \pgfutil@ifnextchar [ { \__tdtools_guard:nNw { ] } \__tdtools_bracket:w }
+                      {
+                        \pgfutil@ifnextchar > \__tdtools_gt:w \__tdtools_end:w
+                      }
+                  }
+              }
+          }
+      }
+  }
+\cs_new_protected:Npn \__tdtools_factor_or_coord:
+  {
+    \pgfutil@ifnextchar ( { \__tdtools_guard:nNw { ) } \__tdtools_coordinate:w }
+      {
+        \pgfutil@ifnextchar [ { \__tdtools_guard:nNw { ] } \__tdtools_bracket:w }
+          {
+            \pgfutil@ifnextchar - \__tdtools_negate:w
+              { \__tdtools_guard:nNw { *( } \__tdtools_factor:w }
+          }
+      }
+  }
+\cs_new_protected:Npn \__tdtools_negate:w - % unary minus (F11)
+  { \fp_set:Nn \l__tdtools_f_fp { - \l__tdtools_f_fp } \__tdtools_factor_or_coord: }
+\cs_new_protected:Npn \__tdtools_add:w +
+  { \fp_set:Nn \l__tdtools_f_fp { 1 } \__tdtools_factor_or_coord: }
+\cs_new_protected:Npn \__tdtools_sub:w -
+  { \fp_set:Nn \l__tdtools_f_fp { -1 } \__tdtools_factor_or_coord: }
+\cs_new_protected:Npn \__tdtools_bracket:w [ #1 ]
+  {
+    \__tdtools_eval:Nn \l__tdtools_t_fp {#1}
+    \fp_set:Nn \l__tdtools_f_fp { \l__tdtools_f_fp * \l__tdtools_t_fp }
+    \__tdtools_factor_or_coord:
+  }
+\cs_new_protected:Npn \__tdtools_factor:w #1 *(
+  {
+    \tl_if_blank:nF {#1} % `[expr]*(...)' as used in the manual
+      {
+        \__tdtools_eval:Nn \l__tdtools_t_fp {#1}
+        \fp_set:Nn \l__tdtools_f_fp { \l__tdtools_t_fp * \l__tdtools_f_fp }
+      }
+    \__tdtools_coordinate:w (
+  }
+\cs_new_protected:Npn \__tdtools_coordinate:w ( #1 )
+  {
+    \__tdtools_coord:nn { \c_false_bool } {#1}
+    \fp_set:Nn \l__tdtools_ax_fp { \l__tdtools_ax_fp + \l__tdtools_f_fp * \l__tdtools_cx_fp }
+    \fp_set:Nn \l__tdtools_ay_fp { \l__tdtools_ay_fp + \l__tdtools_f_fp * \l__tdtools_cy_fp }
+    \fp_set:Nn \l__tdtools_az_fp { \l__tdtools_az_fp + \l__tdtools_f_fp * \l__tdtools_cz_fp }
+    \__tdtools_dispatch:w
+  }
+\cs_new_protected:Npn \__tdtools_shift:n #1
+  {
+    \int_set:Nn \l__tdtools_type_int {#1}
+    \fp_set_eq:NN \l__tdtools_bx_fp \l__tdtools_ax_fp
+    \fp_set_eq:NN \l__tdtools_by_fp \l__tdtools_ay_fp
+    \fp_set_eq:NN \l__tdtools_bz_fp \l__tdtools_az_fp
+    \fp_zero:N \l__tdtools_ax_fp \fp_zero:N \l__tdtools_ay_fp \fp_zero:N \l__tdtools_az_fp
+    \fp_set:Nn \l__tdtools_f_fp { 1 }
+    \__tdtools_factor_or_coord:
+  }
+\cs_new_protected:Npn \__tdtools_vecprod:w x { \__tdtools_shift:n { 1 } }
+\cs_new_protected:Npn \__tdtools_scalprod:w o { \__tdtools_shift:n { 2 } }
+\cs_new_protected:Npn \__tdtools_gt:w > { \__tdtools_end:w } % old end marker
+\cs_new_protected:Npn \__tdtools_end:w #1 \s__tdtools_mark \s__tdtools_stop
+  {
+    \tl_if_blank:nF {#1} { \msg_warning:nnn { 3dtools } { trailing } {#1} }
+    \int_case:nn { \l__tdtools_type_int }
+      {
+        { 0 }
+          {
+            \fp_set_eq:NN \l__tdtools_rx_fp \l__tdtools_ax_fp
+            \fp_set_eq:NN \l__tdtools_ry_fp \l__tdtools_ay_fp
+            \fp_set_eq:NN \l__tdtools_rz_fp \l__tdtools_az_fp
+          }
+        { 1 } % b x a, as \vpauxx etc.
+          {
+            \fp_set:Nn \l__tdtools_rx_fp
+              { \l__tdtools_by_fp * \l__tdtools_az_fp - \l__tdtools_bz_fp * \l__tdtools_ay_fp }
+            \fp_set:Nn \l__tdtools_ry_fp
+              { \l__tdtools_ax_fp * \l__tdtools_bz_fp - \l__tdtools_bx_fp * \l__tdtools_az_fp }
+            \fp_set:Nn \l__tdtools_rz_fp
+              { \l__tdtools_bx_fp * \l__tdtools_ay_fp - \l__tdtools_by_fp * \l__tdtools_ax_fp }
+          }
+        { 2 }
+          {
+            \fp_set:Nn \l__tdtools_rs_fp
+              {
+                \l__tdtools_ax_fp * \l__tdtools_bx_fp
+                + \l__tdtools_ay_fp * \l__tdtools_by_fp
+                + \l__tdtools_az_fp * \l__tdtools_bz_fp
+              }
+          }
+      }
+  }
+\cs_new:Npn \__tdtools_vec_tl:
+  {
+    \fp_to_decimal:N \l__tdtools_rx_fp ,
+    \fp_to_decimal:N \l__tdtools_ry_fp ,
+    \fp_to_decimal:N \l__tdtools_rz_fp
+  }
+\cs_new_protected:Npn \__tdtools_return:e #1
+  {
+    \tl_set:Ne \l__tdtools_result_tl {#1}
+    \exp_args:NNNV
+    \group_end:
+    \tl_set:Nn \pgfmathresult \l__tdtools_result_tl
+  }
+% ---------------------------------------------------------------------------
+% pgfmath-facing functions (same names/arity as the original library)
+\pgfmathdeclarefunction{TD}{1}
+  {
+    \group_begin:
+    \__tdtools_parse:n {#1}
+    \__tdtools_return:e
+      {
+        \int_compare:nNnTF { \l__tdtools_type_int } = { 2 }
+          { \fp_to_decimal:N \l__tdtools_rs_fp } { \__tdtools_vec_tl: }
+      }
+  }
+\pgfmathdeclarefunction{TDunit}{1}
+  {
+    \group_begin:
+    \__tdtools_parse:n {#1}
+    \fp_set:Nn \l__tdtools_t_fp
+      {
+        sqrt ( \l__tdtools_rx_fp * \l__tdtools_rx_fp + \l__tdtools_ry_fp * \l__tdtools_ry_fp
+               + \l__tdtools_rz_fp * \l__tdtools_rz_fp )
+      }
+    \fp_compare:nNnTF { min ( 1 , \l__tdtools_t_fp ) } < { 0.002 }
+      { \PackageWarning{3dtools}{Vector~too~short,~cannot~normalize~it.} }
+      {
+        \fp_set:Nn \l__tdtools_rx_fp { \l__tdtools_rx_fp / \l__tdtools_t_fp }
+        \fp_set:Nn \l__tdtools_ry_fp { \l__tdtools_ry_fp / \l__tdtools_t_fp }
+        \fp_set:Nn \l__tdtools_rz_fp { \l__tdtools_rz_fp / \l__tdtools_t_fp }
+      }
+    \__tdtools_return:e { \__tdtools_vec_tl: }
+  }
+\pgfmathdeclarefunction{tddistance}{2}
+  {
+    \group_begin:
+    \__tdtools_parse:n { #1 - #2 o #1 - #2 }
+    \__tdtools_return:e { \fp_to_decimal:n { sqrt ( \l__tdtools_rs_fp ) } }
+  }
+% screen normal from the current x/y/z unit vectors (as in the original)
+\cs_new:Npn \__tdtools_nscreen:NNNN #1#2#3#4
+  { ( #1 * #2 - #3 * #4 ) / \c__tdtools_cmsq_fp }
+\cs_new:Npn \__tdtools_nx: { \__tdtools_nscreen:NNNN \pgf@yx \pgf@zy \pgf@yy \pgf@zx }
+\cs_new:Npn \__tdtools_ny: { \__tdtools_nscreen:NNNN \pgf@zx \pgf@xy \pgf@xx \pgf@zy }
+\cs_new:Npn \__tdtools_nz: { \__tdtools_nscreen:NNNN \pgf@xx \pgf@yy \pgf@yx \pgf@xy }
+\pgfmathdeclarefunction{screendepth}{3}
+  {
+    \tl_set:Ne \pgfmathresult
+      {
+        \fp_to_decimal:n
+          {
+            \__tdtools_nx: * ( \__tdtools_num:n {#1} )
+            + \__tdtools_ny: * ( \__tdtools_num:n {#2} )
+            + \__tdtools_nz: * ( \__tdtools_num:n {#3} )
+          }
+      }
+  }
+\pgfmathdeclarefunction*{nscreenx}{0}
+  { \tl_set:Ne \pgfmathresult { \fp_to_decimal:n { \__tdtools_nx: } } }
+\pgfmathdeclarefunction*{nscreeny}{0}
+  { \tl_set:Ne \pgfmathresult { \fp_to_decimal:n { \__tdtools_ny: } } }
+\pgfmathdeclarefunction*{nscreenz}{0}
+  { \tl_set:Ne \pgfmathresult { \fp_to_decimal:n { \__tdtools_nz: } } }
+% internal entry points used elsewhere in the library (interfaces unchanged;
+% \tikz@td@parse@coord touches no \pgfutil@tmp* macros)
+\cs_new_protected:Npn \pgfmathtdparse #1
+  {
+    \group_begin:
+    \__tdtools_parse:n {#1}
+    \__tdtools_return:e
+      {
+        \int_compare:nNnTF { \l__tdtools_type_int } = { 2 }
+          { \fp_to_decimal:N \l__tdtools_rs_fp } { \__tdtools_vec_tl: }
+      }
+  }
+\cs_new_protected:Npn \tikz@td@parse@coord (#1)
+  {
+    \__tdtools_coord:nn { \c_false_bool } {#1}
+    \tl_set:Ne \pgf@X { \fp_to_decimal:N \l__tdtools_cx_fp pt }
+    \tl_set:Ne \pgf@Y { \fp_to_decimal:N \l__tdtools_cy_fp pt }
+    \tl_set:Ne \pgf@Z { \fp_to_decimal:N \l__tdtools_cz_fp pt }
+  }
+% ---------------------------------------------------------------------------
+% .sort numeric list: l3sort (merge sort, stable) instead of bubble sort.
+\seq_new:N \l__tdtools_sort_seq
+\int_new:N \l__tdtools_sort_int
+\tl_new:N \l__tdtools_cmp_tl
+\tl_new:N \l__tdtools_vals_tl
+\tl_new:N \l__tdtools_perm_tl
+\cs_new_protected:Npn \__tdtools_sort_numeric:NN #1#2
+  {
+    \group_begin:
+    \seq_clear:N \l__tdtools_sort_seq
+    \int_zero:N \l__tdtools_sort_int
+    \tl_set:Ne \l__tdtools_cmp_tl { \pgfkeysvalueof { /list~management/sort~comparison } }
+    \tl_set:Ne \l__tdtools_tmp_tl { \pgfkeysvalueof { \pgfkeyscurrentpath } }
+    \seq_set_split:NnV \l__tdtools_comp_seq { , } \l__tdtools_tmp_tl
+    \seq_map_inline:Nn \l__tdtools_comp_seq
+      {
+        \int_incr:N \l__tdtools_sort_int
+        \pgfkeys { /list~management/sort~map = ##1 }
+        \seq_put_right:Ne \l__tdtools_sort_seq
+          { { \pgfmathresult } { \int_use:N \l__tdtools_sort_int } }
+      }
+    \seq_sort:Nn \l__tdtools_sort_seq { \__tdtools_sort_cmp:nnnn ##1 ##2 }
+    \tl_set:Ne \l__tdtools_vals_tl
+      { \seq_map_tokens:Nn \l__tdtools_sort_seq { \__tdtools_sort_first:n } }
+    \tl_set:Ne \l__tdtools_perm_tl
+      { \seq_map_tokens:Nn \l__tdtools_sort_seq { \__tdtools_sort_second:n } }
+    \use:e
+      {
+        \group_end:
+        \tl_set:Nn \exp_not:N #1 { \tl_tail:V \l__tdtools_vals_tl }
+        \tl_set:Nn \exp_not:N #2 { \tl_tail:V \l__tdtools_perm_tl }
+      }
+  }
+\cs_new:Npn \__tdtools_sort_first:n #1 { \__tdtools_sort_first:nn #1 }
+\cs_new:Npn \__tdtools_sort_first:nn #1#2 { , \exp_not:n {#1} }
+\cs_new:Npn \__tdtools_sort_second:n #1 { \__tdtools_sort_second:nn #1 }
+\cs_new:Npn \__tdtools_sort_second:nn #1#2 { , \exp_not:n {#2} }
+% bubble sort kept a pair (prev, next) iff `next <cmp> prev'
+\cs_new_protected:Npn \__tdtools_sort_cmp:nnnn #1#2#3#4
+  {
+    \fp_compare:nTF { ( \__tdtools_num:n {#3} ) \l__tdtools_cmp_tl ( \__tdtools_num:n {#1} ) }
+      { \sort_return_same: } { \sort_return_swapped: }
+  }
+\cs_new_eq:NN \tikz@td@sort@numeric \__tdtools_sort_numeric:NN
+\ExplSyntaxOff%
 \long\def\tikz@td@raw@coord(#1){\csname tikz@dcl@coord@#1\endcsname}% 
 \long\def\tikz@td@makesenseof@coord#1{%
 \expanded{\noexpand\pgfutil@in@{(}{#1}}% 
@@ -106,31 +547,6 @@ install view/.style={/utils/exec=\tikzset{3d/.cd,#1}%
 \else
 \tikz@td@parse@coord(#1)%
 \fi
-}%
-\long\def\tikz@td@parse@coord(#1){%
-\pgfutil@tempcnta=0%
-\pgfutil@for\pgf@tmp:={#1}\do{\advance\pgfutil@tempcnta by1}%
-\ifnum\pgfutil@tempcnta=1\relax
-\edef\pgfutil@tmp{\csname tikz@dcl@coord@#1\endcsname}% 
-\fi
-\ifcase\pgfutil@tempcnta
-\or
-\edef\pgfutil@tmp{\csname tikz@dcl@coord@#1\endcsname}% 
-\or
-\edef\pgfutil@tmp{#1,0}%
-\or
-\edef\pgfutil@tmp{#1}%
-\fi%
-\pgfmathparse@td@FPU{xcomp3(\pgfutil@tmp)}% 
-\edef\pgf@X{\pgfmathresult pt}% 
-\pgfmathparse@td@FPU{ycomp3(\pgfutil@tmp)}% 
-\edef\pgf@Y{\pgfmathresult pt}% 
-\pgfmathparse@td@FPU{zcomp3(\pgfutil@tmp)}% 
-\edef\pgf@Z{\pgfmathresult pt}}%
-\pgfmathdeclarefunction{TD}{1}{%
-\begingroup%
-\pgfmathtdparse{#1}%
-\pgfmathsmuggle\pgfmathresult\endgroup%
 }%
 % projections 
 \pgfmathdeclarefunction{xcomp3}{3}{% x component of a 3-vector 
@@ -160,18 +576,6 @@ install view/.style={/utils/exec=\tikzset{3d/.cd,#1}%
 \edef\mycoord{\tikz@td@raw@coord(#1)}%
 \pgfmathparse@td@FPU{zcomp3\mycoord}% 
 \pgfmathsmuggle\pgfmathresult\endgroup}%
-\pgfmathdeclarefunction{TDunit}{1}{%normalized vector
-\begingroup% 
-\pgfmathsetmacro{\pgfutil@tmpv}{TD("#1")}%
-\pgfmathsetmacro@td@FPU{\pgfutil@tmpn}{min(1,sqrt(TD("(\pgfutil@tmpv)o(\pgfutil@tmpv)")))}% changed May 23 2023
-\ifdim\pgfutil@tmpn pt<0.002pt\relax
-\PackageWarning{3dtools}{Vector too short, cannot normalize it.}%
-\let\pgfmathresult\pgfutil@tmpv%
-\else
-\pgfmathsetmacro@td@FPU{\pgfutil@tmpn}{1/sqrt(TD("(\pgfutil@tmpv)o(\pgfutil@tmpv)"))}% % changed May 23 2023
-\pgfmathparse{TD("\pgfutil@tmpn*(\pgfutil@tmpv)")}%
-\fi
-\pgfmathsmuggle\pgfmathresult\endgroup}%
 % \pgfmathdeclarefunction{TDX}{1}{% x component of a 3-vector 
 % \begingroup% 
 % \edef\pgfmathresult{0}%
@@ -190,53 +594,566 @@ install view/.style={/utils/exec=\tikzset{3d/.cd,#1}%
 % \edef\mycoord{\tikz@td@raw@coord#1}%
 % \pgfmathparse@td@FPU{zcomp3\mycoord}% 
 % \pgfmathsmuggle\pgfmathresult\endgroup}%
-\tikzset{3d/record physical components/.code={%
-\tikzset{every coordinate node/.append style={3d/store components}}},
-3d/store components/.code={%
-\edef\pgf@Z{\relax}%
-\edef\pgfutil@tmpz{\relax}%
-\expandafter\tikz@td@parse@coord\tikz@scan@point@coordinate%
-\pgfmathsetmacro\pgfutil@tmpx{\the\pgf@x/1cm}%
-\pgfmathsetmacro\pgfutil@tmpy{\the\pgf@y/1cm}%
-\ifx\pgf@Z\pgfutil@tmpz
-\pgfmathsetmacro\pgfutil@tmpz{screendepth(\pgfutil@tmpx,\pgfutil@tmpy,0)}%
+%% ---------------------------------------------------------------------------
+%% Main frame, local frames, depth tracking and physical components
+%%
+%% The main frame is given by the x, y and z vectors in force when no local
+%% frame is installed (e.g. after 3d/install view). A local frame has an origin
+%% O and basis vectors ex, ey, ez, all in main coordinates; the point with local
+%% coordinates (a,b,c) sits at O+a*ex+b*ey+c*ez. Vectors are stored as comma
+%% lists "x,y,z" without parentheses.
+%%
+%% Depth tracking. With r=(xx,yx,zx), s=(xy,yy,zy) (the rows of the main
+%% projection, in cm) and n=r x s, a point v of the main frame has canvas
+%% position (r.v,s.v) and depth n.v (both in cm). M=(r;s;n) is invertible for
+%% any non-degenerate view, so canvas position plus depth determine v. Every
+%% point TikZ computes carries its depth in \tikz@td@z next to \pgf@x/\pgf@y:
+%% \pgfpointxyz, \pgfpointxy and \pgfpointpolarxy set it, node anchors take the
+%% depth of the node, canvas points have depth 0 (they lie in the screen plane
+%% through the origin of the current coordinate system), and the affine
+%% constructions (++, +, calc's +, -, factors and !t!, pos= on straight
+%% segments, shift={(...)}) propagate it. \tikz@td@sd is the depth of the origin
+%% of the current coordinate system. Every named node or coordinate stores
+%% {D}{cx}{cy}{px}{py}{z}{ok}{exact}{{picture}{main vectors}{frame}{context}}
+%% in \tikz@td@n@<name>: depth D=z+\tikz@td@sd and canvas position (cx,cy),
+%% the same before the transformation (px,py,z), whether the depth is known,
+%% and whether the stored text of the coordinate is the point (then TD uses the
+%% text, which is exact, as long as it is evaluated in the same context).
+\newif\iftikz@td@lf@active
+\newif\iftikz@td@lf@orthonormalize
+\newif\iftikz@td@zok\tikz@td@zoktrue % global: depth of the last point is known
+\newif\iftikz@td@simple % global: the last point was a plain xyz/xy literal
+\newif\iftikz@td@untracked % local: depths cannot be tracked in this scope
+\newif\iftikz@td@keeptext % local: 3d coordinate, TD keeps using the text
+\newdimen\tikz@td@z \newdimen\tikz@td@za
+\newdimen\tikz@td@dzx \newdimen\tikz@td@dzy \newdimen\tikz@td@dzz
+\newdimen\tikz@td@sd
+\newdimen\tikz@td@lastz \newdimen\tikz@td@lastzsaved \newdimen\tikz@td@tstartz
+\newdimen\tikz@td@cza \newdimen\tikz@td@czb
+\newcount\tikz@td@frameid
+\def\tikz@td@lastok{1}\def\tikz@td@lastoksaved{1}\def\tikz@td@lastsimple{0}%
+\def\tikz@td@tstartok{0}\let\tikz@td@tstart\relax\def\tikz@td@lf@id{0}%
+\def\tikz@td@split#1,#2,#3\relax{\def\tikz@td@c@a{#1}\def\tikz@td@c@b{#2}\def\tikz@td@c@c{#3}}%
+\def\tikz@td@pointxyz#1,#2,#3\relax{\pgfpointxyz{#1}{#2}{#3}}%
+\ExplSyntaxOn
+% expandable helpers: scalar product of two comma lists, and the test whether a
+% coordinate text consists of numbers and + - * / ( ) . , only
+\cs_new:Npn \__tdtools_dot:nn #1#2 { \exp_last_unbraced:Ne \__tdtools_dot:w { #1 , #2 } \q_stop }
+\cs_new:Npn \__tdtools_dot:w #1 , #2 , #3 , #4 , #5 , #6 \q_stop
+  { ( #1 ) * ( #4 ) + ( #2 ) * ( #5 ) + ( #3 ) * ( #6 ) }
+\cs_new:Npn \__tdtools_pure:N #1
+  { \if_int_compare:w `#1 = 44 \exp_stop_f: \else: \__tdtools_class:N #1 \fi: }
+\cs_new_protected:Npn \tikz@td@ifpure #1#2#3
+  {
+    \tl_set:Ne \l__tdtools_tmp_tl { \str_map_function:nN {#1} \__tdtools_pure:N }
+    \tl_if_in:NnTF \l__tdtools_tmp_tl { X } {#3} {#2}
+  }
+% \tikz@td@solve{q1,q2,q3}: \tikz@td@lkv = E^{-1} M^{-1} q, with the columns
+% of M^{-1} in \tikz@td@m@da/db/dc and the rows of E^{-1} in \tikz@td@lf@da/db/dc
+\cs_new_protected:Npn \tikz@td@solve #1
+  {
+    \clist_set:Ne \l__tdtools_tmp_clist {#1}
+    \tl_set:Ne \l__tdtools_tmp_tl
+      {
+        \__tdtools_lin:n { 1 } , \__tdtools_lin:n { 2 } , \__tdtools_lin:n { 3 }
+      }
+    \tl_set:Ne \tikz@td@lkv
+      {
+        \fp_eval:n { round ( \__tdtools_dot:nn { \tikz@td@lf@da } { \l__tdtools_tmp_tl } , 5 ) } ,
+        \fp_eval:n { round ( \__tdtools_dot:nn { \tikz@td@lf@db } { \l__tdtools_tmp_tl } , 5 ) } ,
+        \fp_eval:n { round ( \__tdtools_dot:nn { \tikz@td@lf@dc } { \l__tdtools_tmp_tl } , 5 ) }
+      }
+  }
+\cs_generate_variant:Nn \clist_set:Nn { Ne }
+\cs_new:Npn \__tdtools_lin:n #1
+  {
+    \fp_eval:n
+      {
+        ( \clist_item:Nn \l__tdtools_tmp_clist { 1 } ) * ( \clist_item:Nn \tikz@td@m@da {#1} )
+        + ( \clist_item:Nn \l__tdtools_tmp_clist { 2 } ) * ( \clist_item:Nn \tikz@td@m@db {#1} )
+        + ( \clist_item:Nn \l__tdtools_tmp_clist { 3 } ) * ( \clist_item:Nn \tikz@td@m@dc {#1} )
+      }
+  }
+\cs_new_eq:NN \tikz@td@dot \__tdtools_dot:nn
+\ExplSyntaxOff
+% \tikz@td@dualbasis{v1}{v2}{v3}: \tikz@td@da, \tikz@td@db, \tikz@td@dc with
+% d_i.v_j = delta_ij, i.e. the rows of the inverse of the matrix with columns
+% v1, v2, v3 (=columns of the inverse of the matrix with rows v1, v2, v3).
+% \tikz@td@det is the determinant; it is empty if the vectors are degenerate.
+\def\tikz@td@dualbasis#1#2#3{%
+\pgfmathsetmacro\tikz@td@da{TD("(#2)x(#3)")}%
+\pgfmathsetmacro\tikz@td@db{TD("(#3)x(#1)")}%
+\pgfmathsetmacro\tikz@td@dc{TD("(#1)x(#2)")}%
+\pgfmathsetmacro\tikz@td@det{TD("(#1)o(\tikz@td@da)")}%
+\ifdim\fpeval{abs(\tikz@td@det)}pt<0.00001pt\relax
+\let\tikz@td@det\pgfutil@empty
 \else
-\pgfmathsetmacro\pgfutil@tmpz{screendepth(\pgf@X,\pgf@Y,\pgf@Z)}%
+\edef\tikz@td@inv{\fpeval{1/\tikz@td@det}}%
+\pgfmathsetmacro\tikz@td@da{TD("\tikz@td@inv*(\tikz@td@da)")}%
+\pgfmathsetmacro\tikz@td@db{TD("\tikz@td@inv*(\tikz@td@db)")}%
+\pgfmathsetmacro\tikz@td@dc{TD("\tikz@td@inv*(\tikz@td@dc)")}%
+\fi}%
+% \tikz@td@minv{xx,xy,yx,yy,zx,zy} (dimensions): projection rows \tikz@td@m@r
+% and \tikz@td@m@s, normal \tikz@td@m@n and the columns \tikz@td@m@da/db/dc of
+% M^{-1}, which maps (canvas x, canvas y, depth) to coordinates. Cached.
+\def\tikz@td@minv#1{%
+\ifcsname tikz@td@minv@#1\endcsname\else\tikz@td@minv@compute#1\relax\fi
+\csname tikz@td@minv@#1\endcsname}%
+\def\tikz@td@minv@compute#1,#2,#3,#4,#5,#6\relax{%
+\begingroup
+\edef\tikz@td@m@r{\fpeval{#1/1cm},\fpeval{#3/1cm},\fpeval{#5/1cm}}%
+\edef\tikz@td@m@s{\fpeval{#2/1cm},\fpeval{#4/1cm},\fpeval{#6/1cm}}%
+\pgfmathsetmacro\tikz@td@m@n{TD("(\tikz@td@m@r)x(\tikz@td@m@s)")}%
+\tikz@td@dualbasis\tikz@td@m@r\tikz@td@m@s\tikz@td@m@n
+\ifx\tikz@td@det\pgfutil@empty
+\PackageWarning{3dtools}{The view is degenerate (x, y and z vectors are
+coplanar on the screen). Depths and physical components are meaningless.}%
+\def\tikz@td@da{0,0,0}\let\tikz@td@db\tikz@td@da\let\tikz@td@dc\tikz@td@da
 \fi
-\expandafter\xdef\csname tikz@td@physical@x@\tikz@fig@name\endcsname{\pgfutil@tmpx}%
-\expandafter\xdef\csname tikz@td@physical@y@\tikz@fig@name\endcsname{\pgfutil@tmpy}%
-\expandafter\xdef\csname tikz@td@physical@z@\tikz@fig@name\endcsname{\pgfutil@tmpz}%
-}}
-\pgfmathdeclarefunction{TDphysx}{1}{%
-\begingroup%
-\ifcsname tikz@td@physical@x@#1\endcsname
-\expandafter\edef\expandafter\pgfmathresult\expandafter{\csname tikz@td@physical@x@#1\endcsname}%
-\else
-\PackageWarning{3dtools}{Physical x component of #1 not stored. Setting it to 0.}%
-\edef\pgfmathresult{0}%
+\expandafter\xdef\csname tikz@td@minv@#1,#2,#3,#4,#5,#6\endcsname{%
+\def\noexpand\tikz@td@m@r{\tikz@td@m@r}\def\noexpand\tikz@td@m@s{\tikz@td@m@s}%
+\def\noexpand\tikz@td@m@n{\tikz@td@m@n}\def\noexpand\tikz@td@m@da{\tikz@td@da}%
+\def\noexpand\tikz@td@m@db{\tikz@td@db}\def\noexpand\tikz@td@m@dc{\tikz@td@dc}}%
+\endgroup}%
+\def\tikz@td@curvec{\the\pgf@xx,\the\pgf@xy,\the\pgf@yx,\the\pgf@yy,\the\pgf@zx,\the\pgf@zy}%
+\def\tikz@td@mainvec{\iftikz@td@lf@active\tikz@td@m@vecstr\else\tikz@td@curvec\fi}%
+% context of a TD evaluation (transformation in \tikz@td@T, set beforehand)
+\def\tikz@td@ctxkey{\tikz@td@T|\tikz@td@curvec|\the\tikz@td@sd|\tikz@td@lf@id}%
+% \tikz@td@lf@getmain: unless a local frame is active (then the data stored by
+% the frame are kept), store the main frame: transformation \tikz@td@m@T, the
+% state \tikz@td@m@state (vectors, depth vectors, depth of the origin) and the
+% vectors \tikz@td@m@vecstr; then load \tikz@td@m@r etc. (\tikz@td@minv).
+\def\tikz@td@lf@getmain{%
+\iftikz@td@lf@active\else
+\pgfgettransform\tikz@td@m@T
+\edef\tikz@td@m@vecstr{\tikz@td@curvec}%
+\edef\tikz@td@m@state{\pgf@xx=\the\pgf@xx\pgf@xy=\the\pgf@xy
+ \pgf@yx=\the\pgf@yx\pgf@yy=\the\pgf@yy\pgf@zx=\the\pgf@zx\pgf@zy=\the\pgf@zy
+ \tikz@td@dzx=\the\tikz@td@dzx\tikz@td@dzy=\the\tikz@td@dzy
+ \tikz@td@dzz=\the\tikz@td@dzz\tikz@td@sd=\the\tikz@td@sd\relax}%
 \fi
-\pgfmathsmuggle\pgfmathresult\endgroup%
+\expandafter\tikz@td@minv\expandafter{\tikz@td@m@vecstr}}%
+\def\tikz@td@lf@restoremain{\pgfsettransform{\tikz@td@m@T}\tikz@td@m@state}%
+% identity frame; \tikz@td@lf@g holds the frame installed last (global)
+\def\tikz@td@lf@identity{\def\tikz@td@lf@o{0,0,0}\def\tikz@td@lf@a{1,0,0}%
+\def\tikz@td@lf@b{0,1,0}\def\tikz@td@lf@c{0,0,1}\def\tikz@td@lf@da{1,0,0}%
+\def\tikz@td@lf@db{0,1,0}\def\tikz@td@lf@dc{0,0,1}}%
+\let\tikz@td@lf@g\tikz@td@lf@identity
+\expandafter\let\csname tikz@td@lf@tab@0\endcsname\tikz@td@lf@identity
+% frame used by TDtomain and TDtolocal: the active one, otherwise the last one
+\def\tikz@td@lf@load{\iftikz@td@lf@active\else\tikz@td@lf@g\fi}%
+% --- depth vectors: dz_i = n_i*1cm, recomputed whenever x, y or z change
+\def\tikz@td@updatedz{%
+\tikz@td@dzx=\dimexpr\pgf@yx*\pgf@zy/1864679-\pgf@zx*\pgf@yy/1864679\relax
+\tikz@td@dzy=\dimexpr\pgf@zx*\pgf@xy/1864679-\pgf@xx*\pgf@zy/1864679\relax
+\tikz@td@dzz=\dimexpr\pgf@xx*\pgf@yy/1864679-\pgf@yx*\pgf@xy/1864679\relax}%
+\tikz@td@updatedz
+\let\tikz@td@orig@pgfsetxvec\pgfsetxvec
+\let\tikz@td@orig@pgfsetyvec\pgfsetyvec
+\let\tikz@td@orig@pgfsetzvec\pgfsetzvec
+\def\pgfsetxvec#1{\tikz@td@orig@pgfsetxvec{#1}\tikz@td@updatedz\ignorespaces}%
+\def\pgfsetyvec#1{\tikz@td@orig@pgfsetyvec{#1}\tikz@td@updatedz\ignorespaces}%
+\def\pgfsetzvec#1{\tikz@td@orig@pgfsetzvec{#1}\tikz@td@updatedz\ignorespaces}%
+% --- producers
+\def\tikz@td@zreset{\global\tikz@td@z=0pt\global\tikz@td@zoktrue\global\tikz@td@simplefalse}%
+\protected\def\tikz@td@zunknown{\global\tikz@td@zokfalse\global\tikz@td@simplefalse}%
+\protected\def\tikz@td@setz#1#2{\global\tikz@td@z=#1\relax
+\ifnum#2=0 \global\tikz@td@zokfalse\fi\global\tikz@td@simplefalse}%
+\let\tikz@td@orig@pgfpointxyz\pgfpointxyz
+\def\pgfpointxyz#1#2#3{\tikz@td@orig@pgfpointxyz{#1}{#2}{#3}%
+\global\tikz@td@z=\pgftemp@x\tikz@td@dzx
+\global\advance\tikz@td@z by\pgftemp@y\tikz@td@dzy
+\global\advance\tikz@td@z by\pgftemp@z\tikz@td@dzz\global\tikz@td@simpletrue}%
+\let\tikz@td@orig@pgfpointxy\pgfpointxy
+\def\pgfpointxy#1#2{\tikz@td@orig@pgfpointxy{#1}{#2}%
+\global\tikz@td@z=\pgftemp@x\tikz@td@dzx
+\global\advance\tikz@td@z by\pgftemp@y\tikz@td@dzy\global\tikz@td@simpletrue}%
+\let\tikz@td@orig@pgfpointpolarxy\pgfpointpolarxy
+\def\pgfpointpolarxy#1#2{\tikz@td@orig@pgfpointpolarxy{#1}{#2}%
+\global\tikz@td@z=\pgf@sys@tonumber\pgf@xa\tikz@td@dzx
+\global\advance\tikz@td@z by\pgf@sys@tonumber\pgf@ya\tikz@td@dzy\global\tikz@td@simplefalse}%
+% named coordinates (A) and anchors (A.north) get the depth of the node (nodes
+% are flat on the screen); see \tikz@parse@node below
+\def\tikz@td@anchorz#1{%
+\ifcsname tikz@td@n@#1\endcsname
+\expandafter\expandafter\expandafter\tikz@td@anchorz@\csname tikz@td@n@#1\endcsname
+\else\tikz@td@zunknown\fi}%
+\def\tikz@td@anchorz@#1#2#3#4#5#6#7#8#9{\tikz@td@anchorz@@{#1}{#7}#9}%
+\def\tikz@td@anchorz@@#1#2#3#4#5#6{% D ok picture vectors frame context
+\global\tikz@td@z=\dimexpr#1-\tikz@td@sd\relax\global\tikz@td@simplefalse
+\ifnum#2=0 \global\tikz@td@zokfalse\fi
+\def\tikz@td@tmp{#3}\ifx\tikz@td@tmp\pgfpictureid\else\global\tikz@td@zokfalse\fi}%
+% --- the current point of a path carries its depth
+\def\tikz@last@position{\pgfqpoint{\tikz@lastx}{\tikz@lasty}%
+\tikz@td@setz\tikz@td@lastz\tikz@td@lastok}%
+\def\tikz@last@position@saved{\pgfqpoint{\tikz@lastxsaved}{\tikz@lastysaved}%
+\tikz@td@setz\tikz@td@lastzsaved\tikz@td@lastoksaved}%
+\let\tikz@td@orig@makelast\tikz@make@last@position
+\def\tikz@make@last@position#1{%
+\tikz@td@zreset
+\iftikz@updatecurrent\let\tikz@td@next\tikz@td@savelast\else\let\tikz@td@next\relax\fi
+\tikz@td@orig@makelast{#1}%
+\tikz@td@lastz=\tikz@td@z
+\edef\tikz@td@lastok{\iftikz@td@zok1\else0\fi}%
+\edef\tikz@td@lastsimple{\iftikz@td@simple1\else0\fi}%
+\let\tikz@td@lastspec\tikz@scan@point@coordinate
+\tikz@td@next}%
+\def\tikz@td@savelast{\tikz@td@lastzsaved=\tikz@td@lastz\let\tikz@td@lastoksaved\tikz@td@lastok}%
+% named coordinates (A) are evaluated while scanning
+\let\tikz@td@orig@parsenode\tikz@parse@node
+\def\tikz@parse@node#1(#2){\def\tikz@td@cont{#1}\tikz@td@nodename#2.\tikz@stop
+\tikz@td@orig@parsenode\tikz@td@nodecont(#2)}%
+\def\tikz@td@nodename#1.#2\tikz@stop{\def\tikz@td@tmpb{#1}}%
+\def\tikz@td@nodecont#1{\tikz@td@zreset
+\ifcsname tikz@td@n@\tikz@pp@name{\tikz@td@tmpb}\endcsname
+\tikz@td@anchorz{\tikz@pp@name{\tikz@td@tmpb}}\else\tikz@td@anchorz{\tikz@td@tmpb}\fi
+\edef\tikz@td@tmp{\noexpand\tikz@td@cont{\unexpanded{#1}%
+\noexpand\tikz@td@setz{\the\tikz@td@z}{\iftikz@td@zok1\else0\fi}}}\tikz@td@tmp}%
+% ++(...) and +(...)
+\def\tikz@add#1{\tikz@doafter{\tikz@td@pointadd{#1}{\tikz@last@position@saved}}}%
+\def\tikz@td@pointadd#1#2{%
+\tikz@td@zreset\pgf@process{#1}\pgf@xa=\pgf@x\pgf@ya=\pgf@y\tikz@td@za=\tikz@td@z
+\pgf@process{#2}%
+\global\advance\pgf@x by\pgf@xa\global\advance\pgf@y by\pgf@ya
+\global\advance\tikz@td@z by\tikz@td@za\global\tikz@td@simplefalse}%
+% start of a straight segment, for pos=
+\let\tikz@td@orig@@lineto\tikz@@lineto
+\def\tikz@@lineto#1{%
+\edef\tikz@td@tstart{\noexpand\pgfqpoint{\the\tikz@lastx}{\the\tikz@lasty}}%
+\tikz@td@tstartz=\tikz@td@lastz\let\tikz@td@tstartok\tikz@td@lastok
+\tikz@td@orig@@lineto{#1}}%
+% shift={(...)}: the origin moves in 3d
+\tikzset{shift/.code={\tikz@addtransform{\tikz@scan@one@point\tikz@td@shift#1\relax}}}%
+\def\tikz@td@shift#1{\tikz@td@zreset\pgf@process{#1}%
+\pgftransformshift{\pgfqpoint{\pgf@x}{\pgf@y}}%
+\iftikz@td@zok\advance\tikz@td@sd by\tikz@td@z\else\tikz@td@untrackedtrue\fi}%
+% ([options]...): only shifts are tracked
+\def\tikz@scan@handle@options#1{%
+  {%
+    \pgftransformreset
+    \let\tikz@transform=\pgfutil@empty
+    \tikz@td@za=\tikz@td@sd
+    \expandafter\tikzset\expandafter{\tikz@scan@point@options}%
+    \tikz@transform
+    \advance\tikz@td@za by-\tikz@td@sd
+    \tikz@td@zreset\pgf@process{#1}%
+    \global\advance\tikz@td@z by-\tikz@td@za
+    \edef\tikz@td@tmp{\iftikz@td@zok\ifpgf@pt@identity\iftikz@td@untracked0\else1\fi
+     \else0\fi\else0\fi}%
+    \pgf@process{\pgfpointtransformed{\pgfqpoint{\pgf@x}{\pgf@y}}}%
+    \xdef\tikz@marshal{\expandafter\noexpand\tikz@scan@point@recall{%
+      \noexpand\pgfqpoint{\the\pgf@x}{\the\pgf@y}%
+      \noexpand\tikz@td@setz{\the\tikz@td@z}{\tikz@td@tmp}}}%
+  }%
+  \tikz@marshal
 }%
-\pgfmathdeclarefunction{TDphysy}{1}{%
-\begingroup%
-\ifcsname tikz@td@physical@y@#1\endcsname
-\expandafter\edef\expandafter\pgfmathresult\expandafter{\csname tikz@td@physical@y@#1\endcsname}%
-\else
-\PackageWarning{3dtools}{Physical y component of #1 not stored. Setting it to 0.}%
-\edef\pgfmathresult{0}%
-\fi
-\pgfmathsmuggle\pgfmathresult\endgroup%
+% perpendicular coordinates (A|-B) have no 3d meaning
+\def\tikz@parse@vhdone#1(#2|-#3){%
+  {%
+    \tikz@@@scan@@absolute\tikz@parse@vh@mid(#2)%
+    \tikz@@@scan@@absolute\tikz@parse@vh@end(#3)%
+    \xdef\tikz@marshal{\noexpand#1{\noexpand\pgfqpoint{\the\pgf@xa}{\the\pgf@ya}%
+      \noexpand\tikz@td@zunknown}}%
+  }%
+  \tikz@marshal
 }%
-\pgfmathdeclarefunction{TDphysz}{1}{%
-\begingroup%
-\ifcsname tikz@td@physical@z@#1\endcsname
-\expandafter\edef\expandafter\pgfmathresult\expandafter{\csname tikz@td@physical@z@#1\endcsname}%
+% scopes in which depths are lost
+\let\tikz@td@orig@canvasplane\tikz@canvas@is@plane
+\def\tikz@canvas@is@plane{\tikz@td@untrackedtrue\tikz@td@orig@canvasplane}%
+\tikzset{reset cm/.append code={\tikz@td@untrackedtrue}}%
+% calc: propagate the depth through +, -, factors and !t!; everything else
+% (distances, projections, rotations) makes it unknown
+\def\tikz@td@patchcalc{%
+\ifdefined\tikz@cc@after@num\ifx\tikz@td@calcdone\relax\else
+\global\let\tikz@td@calcdone\relax
+\gdef\tikz@parse@calculator##1(${%$
+  \def\tikz@cc@command{##1}%
+  \begingroup
+    \pgf@xa=0pt\pgf@ya=0pt\tikz@td@cza=0pt\def\tikz@td@cok{1}\def\tikz@td@cpend{0}%
+    \tikz@cc@parse+}%
+\global\let\tikz@td@orig@ccparse\tikz@cc@parse
+\gdef\tikz@cc@parse{%
+  \ifnum\tikz@td@cpend=1 \advance\tikz@td@cza by\tikz@cc@factor\tikz@td@czb
+  \def\tikz@td@cpend{0}\fi
+  \tikz@td@orig@ccparse}%
+\gdef\tikz@cc@after@coordinate##1{%
+  \tikz@td@zreset\pgf@process{##1}%
+  \pgf@xb=\pgf@x\pgf@yb=\pgf@y\tikz@td@czb=\tikz@td@z
+  \iftikz@td@zok\else\def\tikz@td@cok{0}\fi\def\tikz@td@cpend{1}%
+  \tikz@cc@mid@checks}%
+\gdef\tikz@cc@after@num##1{%
+  \tikz@td@zreset\pgf@process{##1}%
+  \iftikz@td@zok\else\def\tikz@td@cok{0}\fi
+  \tikz@td@czb=\tikz@cc@mid@factor@one\tikz@td@czb
+  \advance\tikz@td@czb by\tikz@cc@mid@factor\tikz@td@z
+  \pgf@xb=\tikz@cc@mid@factor@one\pgf@xb
+  \pgf@yb=\tikz@cc@mid@factor@one\pgf@yb
+  \advance\pgf@xb by\tikz@cc@mid@factor\pgf@x
+  \advance\pgf@yb by\tikz@cc@mid@factor\pgf@y
+  \tikz@cc@mid@checks}%
+\global\let\tikz@td@orig@ccunit\tikz@cc@after@unit
+\gdef\tikz@cc@after@unit{\def\tikz@td@cok{0}\tikz@td@orig@ccunit}%
+\global\let\tikz@td@orig@ccproject\tikz@cc@after@project
+\gdef\tikz@cc@after@project{\def\tikz@td@cok{0}\tikz@td@orig@ccproject}%
+\global\let\tikz@td@orig@ccrot\tikz@cc@handle@rot
+\gdef\tikz@cc@handle@rot{\def\tikz@td@cok{0}\tikz@td@orig@ccrot}%
+\gdef\tikz@cc@end$##1){%$
+  \xdef\tikz@marshal{\noexpand\pgfqpoint{\the\pgf@xa}{\the\pgf@ya}%
+    \noexpand\tikz@td@setz{\the\tikz@td@cza}{\tikz@td@cok}}%
+  \endgroup
+  \expandafter\tikz@cc@command\expandafter{\tikz@marshal}}%
+\fi\fi}%
+\tikz@td@patchcalc
+\AtBeginDocument{\tikz@td@patchcalc}%
+% --- recording named nodes and coordinates
+\def\tikz@td@defaultat{\pgfqpoint{\the\tikz@lastx}{\the\tikz@lasty}}%
+\let\tikz@td@orig@nodetrans\tikz@node@transformations
+\def\tikz@node@transformations{\tikz@td@record\tikz@td@orig@nodetrans}%
+\def\tikz@td@record{%
+\def\tikz@td@exact{0}%
+\ifx\tikz@time\pgfutil@empty
+ \ifx\tikz@node@at\tikz@td@defaultat
+  \edef\tikz@td@p{{\the\tikz@lastx}{\the\tikz@lasty}}%
+  \tikz@td@za=\tikz@td@lastz\let\tikz@td@rok\tikz@td@lastok
+  \ifnum\tikz@td@lastsimple=1 \tikz@td@checkexact\fi
+ \else
+  \tikz@td@zreset\pgf@process{\tikz@node@at}%
+  \edef\tikz@td@p{{\the\pgf@x}{\the\pgf@y}}%
+  \edef\tikz@node@at{\noexpand\pgfqpoint\tikz@td@p}%
+  \tikz@td@za=\tikz@td@z\edef\tikz@td@rok{\iftikz@td@zok1\else0\fi}%
+  \ifx\tikz@td@pend\relax\else\expandafter\tikz@td@usepend\tikz@td@pend\fi
+ \fi
 \else
-\PackageWarning{3dtools}{Physical y component of #1 not stored. Setting it to 0.}%
-\edef\pgfmathresult{0}%
+ \def\tikz@td@rok{0}\def\tikz@td@p{{0pt}{0pt}}\tikz@td@za=0pt
+ \ifx\tikz@timer\tikz@timer@line\ifx\tikz@timer@start\tikz@td@tstart
+  \pgf@process{\pgfpointlineattime{\tikz@time}{\tikz@timer@start}{\tikz@timer@end}}%
+  \edef\tikz@td@p{{\the\pgf@x}{\the\pgf@y}}%
+  \tikz@td@za=\tikz@td@lastz\advance\tikz@td@za by-\tikz@td@tstartz
+  \tikz@td@za=\tikz@time\tikz@td@za\advance\tikz@td@za by\tikz@td@tstartz
+  \ifnum\tikz@td@lastok\tikz@td@tstartok=11 \def\tikz@td@rok{1}\fi
+ \fi\fi
 \fi
-\pgfmathsmuggle\pgfmathresult\endgroup%
+\iftikz@td@untracked\def\tikz@td@rok{0}\fi
+\ifx\tikz@fig@name\pgfutil@empty\else
+ \iftikz@td@keeptext
+  \global\expandafter\let\csname tikz@td@n@\tikz@fig@name\endcsname\tikz@td@undefined
+ \else
+  \tikz@td@store
+ \fi
+\fi
+% the node (or pic) has its own coordinate system with origin at the node
+\ifnum\tikz@td@rok=1 \advance\tikz@td@sd by\tikz@td@za\else\tikz@td@untrackedtrue\fi}%
+% coordinate (P) at (...) hands TikZ the canvas position as text; keep its depth
+\global\let\tikz@td@pend\relax
+\def\tikz@@coordinate@at@math#1{%
+  \tikz@td@zreset\pgf@process{#1}%
+  \xdef\tikz@td@pend{{\the\pgf@x}{\the\pgf@y}{\the\tikz@td@z}{\iftikz@td@zok1\else0\fi}}%
+  \edef\tikz@temp{(\the\pgf@x,\the\pgf@y)}%
+  \expandafter\tikz@coordinate@caller\tikz@temp{}%
 }%
+\def\tikz@td@usepend#1#2#3#4{%
+\global\let\tikz@td@pend\relax
+\edef\tikz@td@tmp{{#1}{#2}}\ifx\tikz@td@tmp\tikz@td@p\tikz@td@za=#3\def\tikz@td@rok{#4}\fi}%
+\def\tikz@td@checkexact{%
+\expandafter\ifx\csname tikz@dcl@coord@\tikz@fig@name\endcsname\tikz@td@lastspec
+\def\tikz@td@exact{1}\fi}%
+\def\tikz@td@store{%
+\pgf@process{\pgfpointtransformed{\expandafter\pgfqpoint\tikz@td@p}}%
+\ifnum\tikz@td@exact=1 \pgfgettransform\tikz@td@T\fi
+\expandafter\xdef\csname tikz@td@n@\tikz@fig@name\endcsname{%
+{\the\dimexpr\tikz@td@za+\tikz@td@sd\relax}{\the\pgf@x}{\the\pgf@y}\tikz@td@p
+{\the\tikz@td@za}{\tikz@td@rok}{\tikz@td@exact}%
+{{\pgfpictureid}{\tikz@td@mainvec}{\tikz@td@lf@id}{\ifnum\tikz@td@exact=1 \tikz@td@ctxkey\fi}}}}%
+\tikzset{3d/keep text/.code={\tikz@td@keeptexttrue}}%
+% --- looking a record up: \tikz@td@lkmode is 0 (use the text), 1 (the point is
+% \tikz@td@lkv) or 2 (depth unknown). Inside the picture and under the main view
+% the point was defined with, the result refers to the coordinate system in
+% force (shifts and local frames included); elsewhere (other views, node texts,
+% outside pictures), to the coordinate system the point was defined in.
+\def\tikz@td@lookup#1{\def\tikz@td@lkname{#1}%
+\expandafter\expandafter\expandafter\tikz@td@lookup@\csname tikz@td@n@#1\endcsname}%
+% the stored text is exact if made of numbers and + - * / ( ) . , only
+\def\tikz@td@ifpuretext#1{\expandafter\expandafter\expandafter\tikz@td@ifpure
+\expandafter\expandafter\expandafter{\csname tikz@dcl@coord@\tikz@td@lkname\endcsname}{#1}{}}%
+\def\tikz@td@lookup@#1#2#3#4#5#6#7#8#9{%
+\ifnum#7=0 \def\tikz@td@lkmode{2}\else\tikz@td@lookup@@{#1}{#2}{#3}{#4}{#5}{#6}{#8}#9\fi}%
+\def\tikz@td@lookup@@#1#2#3#4#5#6#7#8#9{% D cx cy px py z exact picture vectors
+\def\tikz@td@tmp{#8}%
+\def\tikz@td@next{\tikz@td@lookup@rec{#4}{#5}{#6}{#7}{#9}}%
+\ifpgfpicture\ifx\tikz@td@tmp\pgfpictureid
+\edef\tikz@td@tmp{\tikz@td@mainvec}\def\tikz@td@tmpb{#9}%
+\ifx\tikz@td@tmp\tikz@td@tmpb
+\def\tikz@td@next{\tikz@td@lookup@cur{#1}{#2}{#3}{#7}}%
+\fi\fi\fi
+\tikz@td@next}%
+\def\tikz@td@lookup@cur#1#2#3#4#5#6{% D cx cy exact frame context
+\def\tikz@td@lkmode{1}%
+\ifnum#4=1
+\pgfgettransform\tikz@td@T\edef\tikz@td@tmp{\tikz@td@ctxkey}\def\tikz@td@tmpb{#6}%
+\ifx\tikz@td@tmp\tikz@td@tmpb\tikz@td@ifpuretext{\def\tikz@td@lkmode{0}}\fi
+\fi
+\ifnum\tikz@td@lkmode=1 \tikz@td@reconstruct{#2}{#3}{#1}\fi}%
+\def\tikz@td@lookup@rec#1#2#3#4#5#6#7{% px py z exact vectors frame context
+\def\tikz@td@lkmode{1}%
+\ifnum#4=1 \tikz@td@ifpuretext{\def\tikz@td@lkmode{0}}\fi
+\ifnum\tikz@td@lkmode=1
+\begingroup
+\tikz@td@minv{#5}%
+\csname tikz@td@lf@tab@#6\endcsname
+\tikz@td@solve{\fpeval{#1/1cm},\fpeval{#2/1cm},\fpeval{#3/1cm}}%
+\xdef\tikz@td@lkv{\tikz@td@lkv}%
+\endgroup
+\fi}%
+% \tikz@td@reconstruct{cx}{cy}{D}: coordinates, in the coordinate system in
+% force, of the point with canvas position (cx,cy) and depth D
+\def\tikz@td@reconstruct#1#2#3{%
+\begingroup
+\tikz@td@lf@getmain
+\iftikz@td@lf@active\else\tikz@td@lf@identity\fi
+\ifpgfpicture\else\tikz@td@sd=0pt\fi
+% invert the transformation: c = A p + s, A = (aa ba; ab bb)
+\edef\tikz@td@tmp{\fpeval{\pgf@pt@aa*\pgf@pt@bb-\pgf@pt@ba*\pgf@pt@ab}}%
+\edef\tikz@td@q{%
+\fpeval{(\pgf@pt@bb*(#1-\pgf@pt@x)-\pgf@pt@ba*(#2-\pgf@pt@y))/\tikz@td@tmp/1cm},%
+\fpeval{(\pgf@pt@aa*(#2-\pgf@pt@y)-\pgf@pt@ab*(#1-\pgf@pt@x))/\tikz@td@tmp/1cm},%
+\fpeval{(#3-\tikz@td@sd)/1cm}}%
+\tikz@td@solve{\tikz@td@q}%
+\xdef\tikz@td@lkv{\tikz@td@lkv}%
+\endgroup}%
+\def\tikz@td@unknownwarning#1{%
+\ifcsname tikz@td@warned@#1\endcsname\else
+\global\expandafter\let\csname tikz@td@warned@#1\endcsname\relax
+\PackageWarning{3dtools}{The 3d position of `#1' is not known (it was defined
+with a curve, an intersection, a perpendicular or non-affine calc coordinate,
+or in a canvas is ... plane scope). Using the text it was defined with}%
+\fi}%
+% --- local frames
+\def\tikz@td@lf@install#1{%
+\begingroup
+\iftikz@td@lf@active\tikz@td@lf@restoremain\tikz@td@lf@activefalse\fi
+\def\tikz@td@lf@id{0}%
+\pgfqkeys{/tikz/3d/local frame}{#1}%
+\edef\pgfutil@tmpo{\pgfkeysvalueof{/tikz/3d/local frame/origin}}%
+\edef\pgfutil@tmpa{\pgfkeysvalueof{/tikz/3d/local frame/ex}}%
+\edef\pgfutil@tmpb{\pgfkeysvalueof{/tikz/3d/local frame/ey}}%
+\edef\pgfutil@tmpc{\pgfkeysvalueof{/tikz/3d/local frame/ez}}%
+\pgfmathsetmacro\pgfutil@tmpo{TD("\pgfutil@tmpo")}%
+\pgfmathsetmacro\pgfutil@tmpa{TD("\pgfutil@tmpa")}%
+\pgfmathsetmacro\pgfutil@tmpb{TD("\pgfutil@tmpb")}%
+\iftikz@td@lf@orthonormalize
+\pgfmathsetmacro\pgfutil@tmpa{TDunit("(\pgfutil@tmpa)")}%
+\pgfmathsetmacro\pgfutil@tmpc{TDunit("(\pgfutil@tmpa)x(\pgfutil@tmpb)")}%
+\pgfmathsetmacro\pgfutil@tmpb{TD("(\pgfutil@tmpc)x(\pgfutil@tmpa)")}%
+\else
+\ifx\pgfutil@tmpc\pgfutil@empty
+\pgfmathsetmacro\pgfutil@tmpc{TD("(\pgfutil@tmpa)x(\pgfutil@tmpb)")}%
+\else
+\pgfmathsetmacro\pgfutil@tmpc{TD("\pgfutil@tmpc")}%
+\fi
+\fi
+\tikz@td@dualbasis\pgfutil@tmpa\pgfutil@tmpb\pgfutil@tmpc
+\ifx\tikz@td@det\pgfutil@empty
+\PackageWarning{3dtools}{The vectors ex=(\pgfutil@tmpa), ey=(\pgfutil@tmpb)
+and ez=(\pgfutil@tmpc) are (almost) coplanar. Local frame not installed.}%
+\global\let\tikz@td@lf@new\relax
+\else
+\xdef\tikz@td@lf@g{\def\noexpand\tikz@td@lf@o{\pgfutil@tmpo}%
+\def\noexpand\tikz@td@lf@a{\pgfutil@tmpa}\def\noexpand\tikz@td@lf@b{\pgfutil@tmpb}%
+\def\noexpand\tikz@td@lf@c{\pgfutil@tmpc}\def\noexpand\tikz@td@lf@da{\tikz@td@da}%
+\def\noexpand\tikz@td@lf@db{\tikz@td@db}\def\noexpand\tikz@td@lf@dc{\tikz@td@dc}}%
+\global\let\tikz@td@lf@new\tikz@td@lf@g
+\edef\pgfutil@tmpn{\pgfkeysvalueof{/tikz/3d/local frame/name}}%
+\ifx\pgfutil@tmpn\pgfutil@empty\else
+\expandafter\xdef\csname tikz@td@lf@named@\pgfutil@tmpn\endcsname{%
+origin={(\pgfutil@tmpo)},ex={(\pgfutil@tmpa)},ey={(\pgfutil@tmpb)},ez={(\pgfutil@tmpc)}}%
+\fi
+\fi
+\endgroup
+\ifx\tikz@td@lf@new\relax\else
+\iftikz@td@lf@active\tikz@td@lf@restoremain\else\tikz@td@lf@getmain\fi
+\tikz@td@lf@new
+\expandafter\tikz@td@split\tikz@td@lf@a\relax
+\pgf@process{\pgfpointxyz{\tikz@td@c@a}{\tikz@td@c@b}{\tikz@td@c@c}}%
+\edef\pgfutil@tmpa{{\the\pgf@x}{\the\pgf@y}}%
+\expandafter\tikz@td@split\tikz@td@lf@b\relax
+\pgf@process{\pgfpointxyz{\tikz@td@c@a}{\tikz@td@c@b}{\tikz@td@c@c}}%
+\edef\pgfutil@tmpb{{\the\pgf@x}{\the\pgf@y}}%
+\expandafter\tikz@td@split\tikz@td@lf@c\relax
+\pgf@process{\pgfpointxyz{\tikz@td@c@a}{\tikz@td@c@b}{\tikz@td@c@c}}%
+\edef\pgfutil@tmpc{{\the\pgf@x}{\the\pgf@y}}%
+\tikz@td@zreset\pgf@process{\expandafter\tikz@td@pointxyz\tikz@td@lf@o\relax}%
+\pgftransformshift{\pgfqpoint{\pgf@x}{\pgf@y}}%
+\advance\tikz@td@sd by\tikz@td@z
+\pgfsetxvec{\expandafter\pgfqpoint\pgfutil@tmpa}%
+\pgfsetyvec{\expandafter\pgfqpoint\pgfutil@tmpb}%
+\pgfsetzvec{\expandafter\pgfqpoint\pgfutil@tmpc}%
+\tikz@td@dzx=\fpeval{\tikz@td@dot{\tikz@td@m@n}{\tikz@td@lf@a}}cm
+\tikz@td@dzy=\fpeval{\tikz@td@dot{\tikz@td@m@n}{\tikz@td@lf@b}}cm
+\tikz@td@dzz=\fpeval{\tikz@td@dot{\tikz@td@m@n}{\tikz@td@lf@c}}cm
+\global\advance\tikz@td@frameid by1
+\edef\tikz@td@lf@id{\the\tikz@td@frameid}%
+\expandafter\xdef\csname tikz@td@lf@tab@\tikz@td@lf@id\endcsname{%
+\def\noexpand\tikz@td@lf@da{\tikz@td@lf@da}\def\noexpand\tikz@td@lf@db{\tikz@td@lf@db}%
+\def\noexpand\tikz@td@lf@dc{\tikz@td@lf@dc}}%
+\tikz@td@lf@activetrue
+\fi}%
+\tikzset{3d/install local frame/.code={\tikz@addtransform{\tikz@td@lf@install{#1}}},
+3d/use local frame/.code={%
+\ifcsname tikz@td@lf@named@#1\endcsname
+\edef\pgfutil@tmp{\noexpand\tikz@addtransform{\noexpand\tikz@td@lf@install{%
+\csname tikz@td@lf@named@#1\endcsname}}}\pgfutil@tmp
+\else
+\PackageWarning{3dtools}{Unknown local frame `#1'.}%
+\fi},
+3d/main frame/.code={\tikz@addtransform{\iftikz@td@lf@active
+\tikz@td@lf@restoremain\tikz@td@lf@activefalse\def\tikz@td@lf@id{0}\fi}},
+3d/local frame/.cd,origin/.initial={(0,0,0)},ex/.initial={(1,0,0)},
+ey/.initial={(0,1,0)},ez/.initial={},name/.initial={},
+orthonormalize/.is if=tikz@td@lf@orthonormalize,orthonormalize/.default=true,
+from dreibein/.style={origin=\pgfkeysvalueof{/tikz/3d/aux keys/A},
+ ex=\pgfkeysvalueof{/tikz/3d/aux keys/ex},ey=\pgfkeysvalueof{/tikz/3d/aux keys/ey},
+ ez=\pgfkeysvalueof{/tikz/3d/aux keys/ez}}}%
+% local -> main and main -> local, for points (the origin is taken into account)
+\pgfmathdeclarefunction{TDtomain}{1}{%
+\begingroup
+\tikz@td@lf@load
+\pgfmathsetmacro\pgfutil@tmpv{TD("#1")}%
+\expandafter\tikz@td@split\pgfutil@tmpv\relax
+\pgfmathparse{TD("(\tikz@td@lf@o)+\tikz@td@c@a*(\tikz@td@lf@a)%
++\tikz@td@c@b*(\tikz@td@lf@b)+\tikz@td@c@c*(\tikz@td@lf@c)")}%
+\pgfmathsmuggle\pgfmathresult\endgroup}%
+\pgfmathdeclarefunction{TDtolocal}{1}{%
+\begingroup
+\tikz@td@lf@load
+\pgfmathsetmacro\pgfutil@tmpv{TD("#1")}%
+\pgfmathsetmacro\pgfutil@tmpa{TD("(\pgfutil@tmpv)-(\tikz@td@lf@o)o(\tikz@td@lf@da)")}%
+\pgfmathsetmacro\pgfutil@tmpb{TD("(\pgfutil@tmpv)-(\tikz@td@lf@o)o(\tikz@td@lf@db)")}%
+\pgfmathsetmacro\pgfutil@tmpc{TD("(\pgfutil@tmpv)-(\tikz@td@lf@o)o(\tikz@td@lf@dc)")}%
+\edef\pgfmathresult{\pgfutil@tmpa,\pgfutil@tmpb,\pgfutil@tmpc}%
+\pgfmathsmuggle\pgfmathresult\endgroup}%
+% --- physical components: every named node and coordinate is recorded, the
+% keys are kept for compatibility
+\tikzset{3d/record physical components/.code={},3d/store components/.code={}}%
+\def\tikz@td@phys#1#2{%
+\ifcsname tikz@td@n@#2\endcsname
+\expandafter\expandafter\expandafter\tikz@td@phys@\csname tikz@td@n@#2\endcsname#1%
+\else
+\PackageWarning{3dtools}{Physical #1 component of #2 not stored. Setting it to 0.}%
+\def\pgfmathresult{0}%
+\fi}%
+\def\tikz@td@phys@#1#2#3#4#5#6#7#8#9{\tikz@td@phys@@{#1}{#2}{#3}{#7}}%
+\def\tikz@td@phys@@#1#2#3#4#5{% D cx cy ok component
+\if z#5\ifnum#4=0 \PackageWarning{3dtools}{The depth of a coordinate is not
+known. Setting it to 0.}\def\pgfmathresult{0}\else
+\edef\pgfmathresult{\fpeval{#1/1cm}}\fi\fi
+\if x#5\edef\pgfmathresult{\fpeval{#2/1cm}}\fi
+\if y#5\edef\pgfmathresult{\fpeval{#3/1cm}}\fi}%
+\pgfmathdeclarefunction{TDphysx}{1}{\begingroup\tikz@td@phys{x}{#1}%
+\pgfmathsmuggle\pgfmathresult\endgroup}%
+\pgfmathdeclarefunction{TDphysy}{1}{\begingroup\tikz@td@phys{y}{#1}%
+\pgfmathsmuggle\pgfmathresult\endgroup}%
+\pgfmathdeclarefunction{TDphysz}{1}{\begingroup\tikz@td@phys{z}{#1}%
+\pgfmathsmuggle\pgfmathresult\endgroup}%
 \pgfmathdeclarefunction{TDphys}{1}{%
 \begingroup%
 \pgfmathsetmacro{\pgfutil@tmpx}{TDphysx("#1")}%
@@ -245,94 +1162,51 @@ install view/.style={/utils/exec=\tikzset{3d/.cd,#1}%
 \edef\pgfmathresult{\pgfutil@tmpx,\pgfutil@tmpy,\pgfutil@tmpz}%
 \pgfmathsmuggle\pgfmathresult\endgroup%
 }%
+% 3d/install dual basis: coordinates dual ex/ey/ez with TDlocalx(P)=dual ex.
+% (phys(P)-phys(origin)) etc., i.e. the rows of the inverse of the matrix that
+% maps coordinates of the current frame to physical components. For orthonormal
+% frames and views they coincide with the images of the basis vectors.
 \tikzset{3d/.cd,local ex/.initial={localex},local ey/.initial={localey},
 local ez/.initial={localez},dual ex/.initial={dualex},dual ey/.initial={dualey},
 dual ez/.initial={dualez},install dual basis/.code={%
-% \path (1,0,0) coordinate (\pgfkeysvalueof{/tikz/3d/local ex})
-% (0,1,0) coordinate (\pgfkeysvalueof{/tikz/3d/local ey})
-% (0,0,1) coordinate (\pgfkeysvalueof{/tikz/3d/local ez});
-% \pgfmathsetmacro{\pgfutil@tmpxx}{x2d("\pgfkeysvalueof{/tikz/3d/local ex}")/1cm}%
-% \pgfmathsetmacro{\pgfutil@tmpxy}{y2d("\pgfkeysvalueof{/tikz/3d/local ex}")/1cm}%
-% \pgfmathsetmacro{\pgfutil@tmpxz}{screendepth(1,0,0)}%
-% \pgfmathsetmacro{\pgfutil@tmpyx}{x2d("\pgfkeysvalueof{/tikz/3d/local ey}")/1cm}%
-% \pgfmathsetmacro{\pgfutil@tmpyy}{y2d("\pgfkeysvalueof{/tikz/3d/local ey}")/1cm}%
-% \pgfmathsetmacro{\pgfutil@tmpyz}{screendepth(0,1,0)}%
-% \pgfmathsetmacro{\pgfutil@tmpzx}{x2d("\pgfkeysvalueof{/tikz/3d/local ez}")/1cm}%
-% \pgfmathsetmacro{\pgfutil@tmpzy}{y2d("\pgfkeysvalueof{/tikz/3d/local ez}")/1cm}%
-% \pgfmathsetmacro{\pgfutil@tmpzz}{screendepth(0,0,1)}%
-% \typeout{((\pgfutil@tmpxx,\pgfutil@tmpxy,\pgfutil@tmpxz),(\pgfutil@tmpyx,\pgfutil@tmpyy,\pgfutil@tmpyz),(\pgfutil@tmpzx,\pgfutil@tmpzy,\pgfutil@tmpzz))}%
-% % ((\the\pgf@yx/1cm)*(\the\pgf@zy/1cm)-(\the\pgf@yy/1cm)*(\the\pgf@zx/1cm))*(#1)+%
-% % ((\the\pgf@zx/1cm)*(\the\pgf@xy/1cm)-(\the\pgf@xx/1cm)*(\the\pgf@zy/1cm))*(#2)+%
-% % ((\the\pgf@xx/1cm)*(\the\pgf@yy/1cm)-(\the\pgf@yx/1cm)*(\the\pgf@xy/1cm))*(#3)}%
-\pgfmathsetmacro{\pgfutil@tmpxx}{\pgf@xx/1cm}%
-\pgfmathsetmacro{\pgfutil@tmpxy}{\pgf@xy/1cm}%
-\pgfmathsetmacro{\pgfutil@tmpxz}{nscreenx}%
-\pgfmathsetmacro{\pgfutil@tmpyx}{\pgf@yx/1cm}%
-\pgfmathsetmacro{\pgfutil@tmpyy}{\pgf@yy/1cm}%
-\pgfmathsetmacro{\pgfutil@tmpyz}{nscreeny}%
-\pgfmathsetmacro{\pgfutil@tmpzx}{\pgf@zx/1cm}%
-\pgfmathsetmacro{\pgfutil@tmpzy}{\pgf@zy/1cm}%
-\pgfmathsetmacro{\pgfutil@tmpzz}{nscreenz}%
-\path (\pgfutil@tmpxx,\pgfutil@tmpxy,\pgfutil@tmpxz) coordinate (\pgfkeysvalueof{/tikz/3d/dual ex})
-	(\pgfutil@tmpyx,\pgfutil@tmpyy,\pgfutil@tmpyz) coordinate (\pgfkeysvalueof{/tikz/3d/dual ey})
-	(\pgfutil@tmpzx,\pgfutil@tmpzy,\pgfutil@tmpzz) coordinate (\pgfkeysvalueof{/tikz/3d/dual ez});
-\typeout{((\pgfutil@tmpxx,\pgfutil@tmpxy,\pgfutil@tmpxz),(\pgfutil@tmpyx,\pgfutil@tmpyy,\pgfutil@tmpyz),(\pgfutil@tmpzx,\pgfutil@tmpzy,\pgfutil@tmpzz))}%
-}}
-\pgfmathdeclarefunction{TDlocalx}{1}{%
-\begingroup%
-\ifcsname tikz@td@physical@x@#1\endcsname
-\expandafter\edef\expandafter\pgfutil@tmpx\expandafter{\csname tikz@td@physical@x@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpy\expandafter{\csname tikz@td@physical@y@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpz\expandafter{\csname tikz@td@physical@z@#1\endcsname}%
-\pgfmathparse@td@FPU{(\pgfutil@tmpx)*(\pgf@xx/1cm)+(\pgfutil@tmpy)*(\pgf@xy/1cm)+(\pgfutil@tmpz)*(nscreenx)}% 
-\else
-\PackageWarning{3dtools}{Physical x component of #1 not stored. Setting result to 0.}%
-\edef\pgfmathresult{0}%
-\fi
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
-\pgfmathdeclarefunction{TDlocaly}{1}{%
-\begingroup%
-\ifcsname tikz@td@physical@y@#1\endcsname
-\expandafter\edef\expandafter\pgfutil@tmpx\expandafter{\csname tikz@td@physical@x@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpy\expandafter{\csname tikz@td@physical@y@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpz\expandafter{\csname tikz@td@physical@z@#1\endcsname}%
-\pgfmathparse@td@FPU{(\pgfutil@tmpx)*(\pgf@yx/1cm)+(\pgfutil@tmpy)*(\pgf@yy/1cm)+(\pgfutil@tmpz)*(nscreeny)}% 
-\else
-\PackageWarning{3dtools}{Physical y component of #1 not stored. Setting result to 0.}%
-\edef\pgfmathresult{0}%
-\fi
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
-\pgfmathdeclarefunction{TDlocalz}{1}{%
-\begingroup%
-\ifcsname tikz@td@physical@z@#1\endcsname
-\expandafter\edef\expandafter\pgfutil@tmpx\expandafter{\csname tikz@td@physical@x@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpy\expandafter{\csname tikz@td@physical@y@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpz\expandafter{\csname tikz@td@physical@z@#1\endcsname}%
-\pgfmathparse@td@FPU{(\pgfutil@tmpx)*(\pgf@zx/1cm)+(\pgfutil@tmpy)*(\pgf@zy/1cm)+(\pgfutil@tmpz)*(nscreenz)}% 
-\else
-\PackageWarning{3dtools}{Physical z component of #1 not stored. Setting result to 0.}%
-\edef\pgfmathresult{0}%
-\fi
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
+\begingroup
+\tikz@td@lf@getmain
+\iftikz@td@lf@active\else\tikz@td@lf@identity\fi
+\pgfutil@for\pgf@tmp:={a,b,c}\do{%
+\edef\pgfutil@tmpe{\csname tikz@td@lf@\pgf@tmp\endcsname}%
+\pgfmathsetmacro\pgfutil@tmpx{TD("(\tikz@td@m@r)o(\pgfutil@tmpe)")}%
+\pgfmathsetmacro\pgfutil@tmpy{TD("(\tikz@td@m@s)o(\pgfutil@tmpe)")}%
+\pgfmathsetmacro\pgfutil@tmpz{TD("(\tikz@td@m@n)o(\pgfutil@tmpe)")}%
+\expandafter\xdef\csname pgfutil@tmpcol\pgf@tmp\endcsname{\pgfutil@tmpx,\pgfutil@tmpy,\pgfutil@tmpz}}%
+\tikz@td@dualbasis\pgfutil@tmpcola\pgfutil@tmpcolb\pgfutil@tmpcolc
+\xdef\pgfutil@tmp{\noexpand\path (\tikz@td@da) coordinate[/tikz/3d/keep text] (\pgfkeysvalueof{/tikz/3d/dual ex})
+ (\tikz@td@db) coordinate[/tikz/3d/keep text] (\pgfkeysvalueof{/tikz/3d/dual ey})
+ (\tikz@td@dc) coordinate[/tikz/3d/keep text] (\pgfkeysvalueof{/tikz/3d/dual ez});}%
+\endgroup
+\pgfutil@tmp}}
+% TDlocal("P"): coordinates of P in the coordinate system in force (main frame
+% or active local frame; in node texts, outside the shifts of the scope).
 \pgfmathdeclarefunction{TDlocal}{1}{%
 \begingroup%
-\ifcsname tikz@td@physical@z@#1\endcsname
-\expandafter\edef\expandafter\pgfutil@tmpx\expandafter{\csname tikz@td@physical@x@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpy\expandafter{\csname tikz@td@physical@y@#1\endcsname}%
-\expandafter\edef\expandafter\pgfutil@tmpz\expandafter{\csname tikz@td@physical@z@#1\endcsname}%
-\pgfmathsetmacro@td@FPU{\pgfutil@tmpa}{(\pgfutil@tmpx)*(\pgf@xx/1cm)+(\pgfutil@tmpy)*(\pgf@xy/1cm)+(\pgfutil@tmpz)*(nscreenx)}% 
-\pgfmathsetmacro@td@FPU{\pgfutil@tmpb}{(\pgfutil@tmpx)*(\pgf@yx/1cm)+(\pgfutil@tmpy)*(\pgf@yy/1cm)+(\pgfutil@tmpz)*(nscreeny)}% 
-\pgfmathsetmacro@td@FPU{\pgfutil@tmpc}{(\pgfutil@tmpx)*(\pgf@zx/1cm)+(\pgfutil@tmpy)*(\pgf@zy/1cm)+(\pgfutil@tmpz)*(nscreenz)}% 
-\edef\pgfmathresult{\pgfutil@tmpa,\pgfutil@tmpb,\pgfutil@tmpc}%
+\ifcsname tikz@td@n@#1\endcsname
+\expandafter\expandafter\expandafter\tikz@td@local@\csname tikz@td@n@#1\endcsname
+\let\pgfmathresult\tikz@td@lkv
 \else
-\PackageWarning{3dtools}{Physical z component of #1 not stored. Setting result to 0.}%
-\edef\pgfmathresult{(0,0,0)}%
+\PackageWarning{3dtools}{Physical components of #1 not stored. Setting result to 0.}%
+\edef\pgfmathresult{0,0,0}%
 \fi
 \pgfmathsmuggle\pgfmathresult\endgroup%
 }%
+\def\tikz@td@local@#1#2#3#4#5#6#7#8#9{\tikz@td@reconstruct{#2}{#3}{#1}}%
+\pgfmathdeclarefunction{TDlocalx}{1}{\begingroup\pgfmathparse{TDlocal("#1")}%
+\expandafter\tikz@td@split\pgfmathresult\relax\let\pgfmathresult\tikz@td@c@a
+\pgfmathsmuggle\pgfmathresult\endgroup}%
+\pgfmathdeclarefunction{TDlocaly}{1}{\begingroup\pgfmathparse{TDlocal("#1")}%
+\expandafter\tikz@td@split\pgfmathresult\relax\let\pgfmathresult\tikz@td@c@b
+\pgfmathsmuggle\pgfmathresult\endgroup}%
+\pgfmathdeclarefunction{TDlocalz}{1}{\begingroup\pgfmathparse{TDlocal("#1")}%
+\expandafter\tikz@td@split\pgfmathresult\relax\let\pgfmathresult\tikz@td@c@c
+\pgfmathsmuggle\pgfmathresult\endgroup}%
 % \def\tizk@td@scalprod#1=#2.#3;{% 
 % \edef\coordA{\tikz@td@raw@coord#2}% 
 % \edef\coordB{\tikz@td@raw@coord#3}% 
@@ -372,78 +1246,19 @@ dual ez/.initial={dualez},install dual basis/.code={%
 \pgfmathsetmacro{\pgftemp@z}{zcomp3(\pgfutil@tmpb)/\pgfutil@tmpa}% 
 \pgfmathtruncatemacro{\itest}{ifthenelse(abs(\pgftemp@z)==1,0,1)}%
 \ifnum\itest=0%
-	\pgfmathtruncatemacro{\jtest}{sign(\pgftemp@x)}%
+	\pgfmathtruncatemacro{\jtest}{sign(\pgftemp@z)}%
 	\ifnum\jtest=1%
 		\edef\pgfutil@tmpc{0,0}%
 	\else
-		\edef\pgfutil@tmpc{180,0}%
+		\edef\pgfutil@tmpc{0,180}%
 	\fi	
 \else
-    % 1 1
-	\pgfmathsetmacro{\pgfutil@tmpb}{acos(\pgftemp@z)}% 
-    \pgfmathsetmacro{\pgfutil@tmpa}{acos(\pgftemp@x/sin(\pgfutil@tmpb))}% 
-    \pgfmathsetmacro{\ntest}{abs(cos(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@x)%
-		+abs(sin(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@y)+abs(cos(\pgfutil@tmpb)-\pgftemp@z)}%
-    \ifdim\ntest pt<0.1pt
-      \edef\pgfutil@tmpc{\pgfutil@tmpa,\pgfutil@tmpb}%
-    \fi
-	% 1 -1
-	\pgfmathsetmacro{\pgfutil@tmpb}{acos(\pgftemp@z)}% 
-    \pgfmathsetmacro{\pgfutil@tmpa}{-acos(\pgftemp@x/sin(\pgfutil@tmpb))}% 
-    \pgfmathsetmacro{\ntest}{abs(cos(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@x)%
-		+abs(sin(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@y)+abs(cos(\pgfutil@tmpb)-\pgftemp@z)}%
-    \ifdim\ntest pt<0.1pt
-      \edef\pgfutil@tmpc{\pgfutil@tmpa,\pgfutil@tmpb}%
-    \fi
-	% -1 1
-	\pgfmathsetmacro{\pgfutil@tmpb}{-acos(\pgftemp@z)}% 
-    \pgfmathsetmacro{\pgfutil@tmpa}{acos(\pgftemp@x/sin(\pgfutil@tmpb))}% 
-    \pgfmathsetmacro{\ntest}{abs(cos(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@x)%
-		+abs(sin(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@y)+abs(cos(\pgfutil@tmpb)-\pgftemp@z)}%
-    \ifdim\ntest pt<0.1pt
-      \edef\pgfutil@tmpc{\pgfutil@tmpa,\pgfutil@tmpb}%
-    \fi
-	% -1 -1
-	\pgfmathsetmacro{\pgfutil@tmpb}{-acos(\pgftemp@z)}%
-    \pgfmathsetmacro{\pgfutil@tmpa}{-acos(\pgftemp@x/sin(\pgfutil@tmpb))}% 
-    \pgfmathsetmacro{\ntest}{abs(cos(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@x)%
-		+abs(sin(\pgfutil@tmpa)*sin(\pgfutil@tmpb)-\pgftemp@y)+abs(cos(\pgfutil@tmpb)-\pgftemp@z)}%
-    \ifdim\ntest pt<0.1pt
-      \edef\pgfutil@tmpc{\pgfutil@tmpa,\pgfutil@tmpb}%
-    \fi
-	%
+	\pgfmathsetmacro{\pgfutil@tmpb}{acos(\pgftemp@z)}% polar angle in [0,180]
+	\pgfmathsetmacro{\pgfutil@tmpa}{atan2(\pgftemp@y,\pgftemp@x)}% azimuth
+	\edef\pgfutil@tmpc{\pgfutil@tmpa,\pgfutil@tmpb}%
 \fi
 \edef\pgfmathresult{\pgfutil@tmpc}%
 \pgfmathsmuggle\pgfmathresult\endgroup} 
-% projection of a 3d coordinate on the normal of the screen
-\pgfmathdeclarefunction{screendepth}{3}{%
-\begingroup%
-\pgfkeys{/pgf/fpu,/pgf/fpu/output format=fixed}%
-\pgfmathparse{%
-((\the\pgf@yx/1cm)*(\the\pgf@zy/1cm)-(\the\pgf@yy/1cm)*(\the\pgf@zx/1cm))*(#1)+%
-((\the\pgf@zx/1cm)*(\the\pgf@xy/1cm)-(\the\pgf@xx/1cm)*(\the\pgf@zy/1cm))*(#2)+%
-((\the\pgf@xx/1cm)*(\the\pgf@yy/1cm)-(\the\pgf@yx/1cm)*(\the\pgf@xy/1cm))*(#3)}%
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
-% returns the x, y and z coordinates of the normal on the screen
-\pgfmathdeclarefunction*{nscreenx}{0}{%
-\begingroup%
-\pgfkeys{/pgf/fpu,/pgf/fpu/output format=fixed}%
-\pgfmathparse{((\the\pgf@yx/1cm)*(\the\pgf@zy/1cm)-(\the\pgf@yy/1cm)*(\the\pgf@zx/1cm))}%
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
-\pgfmathdeclarefunction*{nscreeny}{0}{%
-\begingroup%
-\pgfkeys{/pgf/fpu,/pgf/fpu/output format=fixed}%
-\pgfmathparse{((\the\pgf@zx/1cm)*(\the\pgf@xy/1cm)-(\the\pgf@xx/1cm)*(\the\pgf@zy/1cm))}%
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
-\pgfmathdeclarefunction*{nscreenz}{0}{%
-\begingroup%
-\pgfkeys{/pgf/fpu,/pgf/fpu/output format=fixed}%
-\pgfmathparse{((\the\pgf@xx/1cm)*(\the\pgf@yy/1cm)-(\the\pgf@yx/1cm)*(\the\pgf@xy/1cm))}%
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
 % returns a vector that is orthogonal to the input vector
 \pgfmathdeclarefunction{normalcandidate}{3}{%
 \begingroup%
@@ -482,7 +1297,7 @@ dual ez/.initial={dualez},install dual basis/.code={%
 \repeat
 \loop
 \advance\c@pgf@counta by-1%
-\pgfmathtruncatemacro{\pgfutil@tmpb}{1+rnd*\c@pgf@counta}%
+\pgfmathtruncatemacro{\pgfutil@tmpb}{min(1+rnd*(\c@pgf@counta+1),\c@pgf@counta+1)}%
 \pgfmathtruncatemacro{\pgfutil@tmpc}{{\pgfutil@tmpa}[\pgfutil@tmpb]}%
 \ifnum\c@pgf@counta=\numexpr#1-1\relax
 \edef\pgfmathresult{\pgfutil@tmpc}%
@@ -653,163 +1468,12 @@ x2d("\pgfutil@tmpa")-x2d("\pgfutil@tmpd"))+\pgfutil@tmpe,360)}%
 %
 \def\node@on@layer{\aftergroup\node@@on@layer}
 %
-% the following is very much "inspired" by the calc library 
-\long\def\pgfmathtdparse#1{% < and > really are placeholders for a later integration
-\begingroup% into calc, which however requires changes both in
-% tikzlibrarycalc.code.tex and in tikz.code.tex
-% 
-% tdparse main computation. It's a series of optional factors in front 
-% of coordinates. It is very much copied from the calc library. 
-% maybe one can implement groups via [ ... ]
-% 
-\edef\pgf@Xa{0pt}% We accumulate the result in here. 
-\edef\pgf@Ya{0pt}% 
-\edef\pgf@Za{0pt}% 
-%\typeout{Got #1 to parse.}%
-\tikz@td@cc@parse+#1% 
-}% 
-\def\tikz@td@cc@parse{% 
-\pgfutil@ifnextchar>{% 
-% Ok, we found the end... 
-\tikz@td@cc@end% 
-} 
-{\pgfutil@ifnextchar+{% 
-% Ok, we found a coordinate... 
-\tikz@td@cc@add% 
-}{% 
-\pgfutil@ifnextchar-{% 
-\tikz@td@cc@sub% 
-}{% 
-\pgfutil@ifnextchar x{% 
-\tikz@td@cc@vecprod% 
-}{% 
-\pgfutil@ifnextchar o{% 
-\tikz@td@cc@scalprod% 
-}{% 
-\pgfutil@ifnextchar[{% 
-%\typeout{Found a [.}%
-\tikz@td@cc@pgfparse% 
-}{% \tikzerror{+ or - expected}% 
-\tikz@td@cc@end%
-}% 
-}% 
-}% 
-}% 
-}%
-}%
-}%
-% 
-% The end is reached with > at the moment but this should change 
-% 
-\def\tikz@td@cc@end{% 
-\ifcase\tikz@td@type%
-\pgfmathsetmacro{\pgftemp@x}{\pgf@Xa}% 
-\pgfmathsetmacro{\pgftemp@y}{\pgf@Ya}% 
-\pgfmathsetmacro{\pgftemp@z}{\pgf@Za}% 
-\edef\pgfmathresult{\pgftemp@x,\pgftemp@y,\pgftemp@z}%
-\or%
-\pgfmathsetmacro{\myxa}{\pgf@Xa}%
-\pgfmathsetmacro{\myya}{\pgf@Ya}%
-\pgfmathsetmacro{\myza}{\pgf@Za}%
-\pgfmathsetmacro{\myxb}{\pgf@Xb}%
-\pgfmathsetmacro{\myyb}{\pgf@Yb}%
-\pgfmathsetmacro{\myzb}{\pgf@Zb}%
-\pgfmathsetmacro{\pgftemp@x}{\vpauxx{\myxb}{\myyb}{\myzb}{\myxa}{\myya}{\myza}}% 
-\pgfmathsetmacro{\pgftemp@y}{\vpauxy{\myxb}{\myyb}{\myzb}{\myxa}{\myya}{\myza}}% 
-\pgfmathsetmacro{\pgftemp@z}{\vpauxz{\myxb}{\myyb}{\myzb}{\myxa}{\myya}{\myza}}% 
-%\typeout{P1=(\myxb,\myyb,\myzb),P2=(\myxa,\myya,\myza),P1xP2=(\pgftemp@x,\pgftemp@y,\pgftemp@z)}%
-\edef\pgfmathresult{\pgftemp@x,\pgftemp@y,\pgftemp@z}%
-\or%
-\pgfmathsetmacro{\myxa}{\pgf@Xa}%
-\pgfmathsetmacro{\myya}{\pgf@Ya}%
-\pgfmathsetmacro{\myza}{\pgf@Za}%
-\pgfmathsetmacro{\myxb}{\pgf@Xb}%
-\pgfmathsetmacro{\myyb}{\pgf@Yb}%
-\pgfmathsetmacro{\myzb}{\pgf@Zb}%
-\pgfmathparse@td@FPU{\myxa*\myxb+\myya*\myyb+\myza*\myzb}%
-%\typeout{P1=(\myxb,\myyb,\myzb),P2=(\myxa,\myya,\myza),P1.P2=(\pgmfmathresult)}%
-\fi%
-%\message{result = (\pgftemp@x,\pgftemp@y,\pgftemp@z)=\pgfmathresult^^J}%
-\xdef\tikz@td@type{0}% reset type to linear combination
-\pgfmathsmuggle\pgfmathresult\endgroup}% 
-% 
-\def\tikz@td@cc@add+{% 
-\def\tikz@td@cc@factor{1}% 
-\tikz@td@cc@factororcoordinate% 
-}% 
-\def\tikz@td@cc@sub-{% 
-\def\tikz@td@cc@factor{-1}% 
-\tikz@td@cc@factororcoordinate% 
-}% 
-\def\tikz@td@cc@vecprod x{% 
-%\message{Ah, a vector product^^J}%
-\xdef\tikz@td@type{1}%
-\edef\pgf@Xb{\pgf@Xa}% store current vector in b
-\edef\pgf@Yb{\pgf@Ya}%
-\edef\pgf@Zb{\pgf@Za}%
-\edef\pgf@Xa{0pt}% reset a
-\edef\pgf@Ya{0pt}%
-\edef\pgf@Za{0pt}%
-\def\tikz@td@cc@factor{1}%
-\tikz@td@cc@factororcoordinate% 
-}%
-\def\tikz@td@cc@scalprod o{% 
-%\message{Ah, a scalar product^^J}%
-\xdef\tikz@td@type{2}%
-\edef\pgf@Xb{\pgf@Xa}% store current vector in b
-\edef\pgf@Yb{\pgf@Ya}%
-\edef\pgf@Zb{\pgf@Za}%
-\edef\pgf@Xa{0pt}% reset a
-\edef\pgf@Ya{0pt}%
-\edef\pgf@Za{0pt}%
-\def\tikz@td@cc@factor{1}%
-\tikz@td@cc@factororcoordinate% 
-}%
-% 
-% Check for a factor: If we see a (, its a coordinate... 
-% 
-\def\tikz@td@cc@factororcoordinate{% 
-\pgfutil@ifnextchar({%) 
-% Ok, found coordinate 
-\tikz@td@cc@coordinate% 
-}{% 
-\pgfutil@ifnextchar[{%] 
-% Ok, found ordinary expression to parse
-\tikz@td@cc@pgfparse% 
-}{% 
-\tikz@td@cc@parse@factor% 
-}% 
-}% 
-}% 
-% 
-% ... otherwise it's a factor. It ends at ...*( 
-% 
-\def\tikz@td@cc@pgfparse[#1]{% 
-%\typeout{Parsing expression #1, previously the factor was \tikz@td@cc@factor.}%
-\pgfmathsetmacro{\tikz@td@cc@factor}{\tikz@td@cc@factor*(#1)}%
-%\typeout{Now the factor is \tikz@td@cc@factor.}%
-\tikz@td@cc@factororcoordinate% 
-}% 
-%
-\def\tikz@td@cc@parse@factor#1*({% 
-%\typeout{Factor: got #1}.%
-\pgfmathparse@td@FPU{#1*\tikz@td@cc@factor}% 
-\let\tikz@td@cc@factor=\pgfmathresult% 
-\tikz@td@cc@coordinate(%) 
-}% 
-\def\tikz@td@cc@coordinate(#1){% 
-\tikz@td@parse@coord(#1)% 
-\pgfmathsetmacro{\pgf@Xa}{\pgf@Xa+\tikz@td@cc@factor*\pgf@X}%
-\pgfmathsetmacro{\pgf@Ya}{\pgf@Ya+\tikz@td@cc@factor*\pgf@Y}%
-\pgfmathsetmacro{\pgf@Za}{\pgf@Za+\tikz@td@cc@factor*\pgf@Z}%
-\tikz@td@cc@parse% 
-}% 
 \tikzset{declare function={torusx(\u,\v,\R,\r)=cos(\u)*(\R + \r*cos(\v)); 
 torusy(\u,\v,\R,\r)=(\R + \r*cos(\v))*sin(\u);
 torusz(\u,\v,\R,\r)=\r*sin(\v);
 torusvcrit1(\u,\th)=atan(tan(\th)*sin(\u));% first critical v value
 torusvcrit2(\u,\th)=180+atan(tan(\th)*sin(\u));% second critical v value
-torusvtest(\u,\v,\az,\el)=sin(-vcrit1(\u-\az,\el)+\v);
+torusvtest(\u,\v,\az,\el)=sin(-torusvcrit1(\u-\az,\el)+\v);
 torusdisc(\th,\R,\r)=((pow(\r,2)-pow(\R,2))*pow(cot(\th),2)+% 
 pow(\r,2)*(2+pow(tan(\th),2)))/pow(\R,2);% discriminant
 torusumax(\th,\R,\r)=ifthenelse(torusdisc(\th,\R,\r)>0,asin(sqrt(abs(torusdisc(\th,\R,\r)))),0);
@@ -819,7 +1483,7 @@ torusumax(\th,\R,\r)=ifthenelse(torusdisc(\th,\R,\r)>0,asin(sqrt(abs(torusdisc(\
 insert path={\pgfextra{\pgfmathtdparse{#1}}(\pgfmathresult)}},
 3d coordinate/.style args={#1=#2}{%
 %/utils/exec=\pgfmathtdparse{#2},%
-insert path={\pgfextra{\pgfmathtdparse{#2}}(\pgfmathresult) coordinate #1}}}%
+insert path={\pgfextra{\pgfmathtdparse{#2}}(\pgfmathresult) coordinate[/tikz/3d/keep text] #1}}}%
 \newcommand\pgfmathprintvector[2][]{%
 \begingroup
 \pgfkeys{#1}%
@@ -852,12 +1516,11 @@ plane through/.code args={#1 and #2 and #3 named #4}{%
 %\typeout{#2-#1x#3-#1}%
 \pgfmathsetmacro{\pgfutil@tmpa}{TD("#2-#1x#3-#1")}%
 \pgfmathsetmacro{\pgfutil@tmpb}{TD("(\pgfutil@tmpa)o(\pgfutil@tmpa)")}%
-\ifdim\pgfutil@tmpb pt<0.01pt\relax
+\ifnum\fpeval{\pgfutil@tmpb<0.01}=1\relax
 \PackageWarning{3dtools}{The points #1 and #2 and #3 are either too close to each other or almost
 on one line, so not suited to define a plane.}%
 \else
-\pgfmathsetmacro{\pgfutil@tmpc}{1/sqrt(\pgfutil@tmpb)}%
-\pgfmathsetmacro{\pgfutil@tmpd}{TD("\pgfutil@tmpc*(\pgfutil@tmpa)")}%
+\pgfmathsetmacro{\pgfutil@tmpd}{TDunit("(\pgfutil@tmpa)")}%
 \pgfmathsetmacro{\pgfutil@tmpe}{TD("#1")}%
 %\typeout{normal=(\pgfutil@tmpd),point=(\pgfutil@tmpe),name=#4}%
 \expandafter\xdef\csname tikz@td@plane@normal@#4\endcsname{\pgfutil@tmpd}%
@@ -866,12 +1529,11 @@ on one line, so not suited to define a plane.}%
 \fi
 },%
 plane with normal/.code args={#1 through #2 named #3}{%
-\pgfmathsetmacro{\pgfutil@tmpn}{sqrt(TD("#1o#1"))}%
-\ifdim\pgfutil@tmpn pt<0.02pt\relax
-\PackageWarning{3dtools}{Normal (\pgfutil@tmpn) is too short.}%
+\pgfmathsetmacro{\pgfutil@tmpn}{TD("#1o#1")}%
+\ifnum\fpeval{\pgfutil@tmpn<0.0004}=1\relax
+\PackageWarning{3dtools}{Normal #1 is too short.}%
 \else
-\pgfmathsetmacro{\pgfutil@tmpn}{1/\pgfutil@tmpn}%
-\pgfmathsetmacro{\pgfutil@tmpd}{TD("\pgfutil@tmpn*#1")}%
+\pgfmathsetmacro{\pgfutil@tmpd}{TDunit("#1")}%
 \pgfmathsetmacro{\pgfutil@tmpe}{TD("#2")}%
 \expandafter\xdef\csname tikz@td@plane@normal@#3\endcsname{\pgfutil@tmpd}%
 \expandafter\xdef\csname tikz@td@plane@point@#3\endcsname{\pgfutil@tmpe}%
@@ -882,7 +1544,7 @@ line through/.code args={#1 and #2 named #3}{%
 \pgfmathsetmacro{\pgfutil@tmpd}{TD("#1")}%
 \pgfmathsetmacro{\pgfutil@tmpe}{TD("#2")}%
 \pgfmathsetmacro{\pgfutil@tmpf}{TD("#1-#2o#1-#2")}%
-\ifdim\pgfutil@tmpf pt<0.001pt\relax
+\ifnum\fpeval{\pgfutil@tmpf<0.001}=1\relax
 \PackageWarning{3dtools}{The points #1 and #2 are too close to each other. No line defined.}%
 \else
 \expandafter\xdef\csname tikz@td@line@A@#3\endcsname{\pgfutil@tmpd}%
@@ -894,7 +1556,7 @@ line with direction/.code args={#1 through #2 named #3}{%
 \pgfmathsetmacro{\pgfutil@tmpd}{TD("#2")}%
 \pgfmathsetmacro{\pgfutil@tmpe}{TD("#1+#2")}%
 \pgfmathsetmacro{\pgfutil@tmpf}{TD("#1o#1")}%
-\ifdim\pgfutil@tmpf pt<0.001pt\relax
+\ifnum\fpeval{\pgfutil@tmpf<0.001}=1\relax
 \PackageWarning{3dtools}{The points #1 and #2 are too close to each other. No line defined.}%
 \else
 \expandafter\xdef\csname tikz@td@line@A@#3\endcsname{\pgfutil@tmpd}%
@@ -998,32 +1660,17 @@ project/.code args={#1 on #2}{%
 \pgfmathsetmacro@td@FPU{\pgfutil@tmph}{2*TD("(\pgfutil@tmpa)-(\pgfutil@tmpc)o(\pgfutil@tmpb)-(\pgfutil@tmpa)")}%
 \pgfmathsetmacro@td@FPU{\pgfutil@tmpi}{TD("(\pgfutil@tmpa)-(\pgfutil@tmpc)o(\pgfutil@tmpa)-(\pgfutil@tmpc)")-\pgfutil@tmpr*\pgfutil@tmpr}%
 \pgfmathsetmacro@td@FPU{\pgfutil@tmpj}{sign(\pgfutil@tmph*\pgfutil@tmph-4*\pgfutil@tmpg*\pgfutil@tmpi)}%
-\ifdim\pgfutil@tmpj pt<0pt\relax
+\ifnum\fpeval{\pgfutil@tmpj<0}=1\relax
 \PackageWarning{3dtools}{The sphere and line do not intersect within the uncertainties. Returning (0,0,0) instead.}%
 \else
 \pgfmathsetmacro@td@FPU{\pgfutil@tmpk}{-1*(\pgfutil@tmph+sqrt(\pgfutil@tmph*\pgfutil@tmph-4*\pgfutil@tmpg*\pgfutil@tmpi))/2/\pgfutil@tmpg}%
 %\typeout{k=\pgfutil@tmpk}
-\edef\pgfutil@tmpm{0}%
-\ifdim\pgfutil@tmpk pt>0pt\relax
- \ifdim\pgfutil@tmpk pt<1pt\relax
-  \edef\pgfutil@tmpm{1}%
-  \pgfmathsetmacro{\pgfutil@tmpn}{TD("(\pgfutil@tmpa)+\pgfutil@tmpk*(\pgfutil@tmpb)-\pgfutil@tmpk*(\pgfutil@tmpa)")}%
-  \tikzset{insert path={(\pgfutil@tmpn) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 1})}}%
-  %\typeout{first intersection inserted.}%
- \fi
-\fi
+\pgfmathsetmacro{\pgfutil@tmpn}{TD("(\pgfutil@tmpa)+\pgfutil@tmpk*(\pgfutil@tmpb)-\pgfutil@tmpk*(\pgfutil@tmpa)")}%
+\tikzset{insert path={(\pgfutil@tmpn) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 1})}}%
 \pgfmathsetmacro@td@FPU{\pgfutil@tmpk}{-1*(\pgfutil@tmph-sqrt(\pgfutil@tmph*\pgfutil@tmph-4*\pgfutil@tmpg*\pgfutil@tmpi))/2/\pgfutil@tmpg}%
 %\typeout{k=\pgfutil@tmpk}
-\ifdim\pgfutil@tmpk pt>0pt\relax
- \ifdim\pgfutil@tmpk pt<1pt\relax
-  \pgfmathsetmacro{\pgfutil@tmpn}{TD("(\pgfutil@tmpa)+\pgfutil@tmpk*(\pgfutil@tmpb)-\pgfutil@tmpk*(\pgfutil@tmpa)")}%
-  \ifnum\pgfutil@tmpm=1
-   \tikzset{insert path={(\pgfutil@tmpn) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 2})}}%
-  \else
-   \tikzset{insert path={(\pgfutil@tmpn) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 1})}}%
-  \fi
- \fi
-\fi
+\pgfmathsetmacro{\pgfutil@tmpn}{TD("(\pgfutil@tmpa)+\pgfutil@tmpk*(\pgfutil@tmpb)-\pgfutil@tmpk*(\pgfutil@tmpa)")}%
+\tikzset{insert path={(\pgfutil@tmpn) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 2})}}%
 % cont
 \fi
 \fi
@@ -1031,7 +1678,7 @@ project/.code args={#1 on #2}{%
  \pgfmathsetmacro{\pgfutil@tmpC}{TD("(\pgfutil@tmpc)")}%
  \pgfmathsetmacro{\pgfutil@tmpD}{TD("(\pgfutil@tmpd)")}%
  \pgfmathsetmacro{\pgfutil@tmpi}{sqrt(TD("(\pgfutil@tmpC)-(\pgfutil@tmpD)o(\pgfutil@tmpC)-(\pgfutil@tmpD)"))}%
- \ifdim\pgfutil@tmpi pt<0.05pt\relax
+ \ifnum\fpeval{\pgfutil@tmpi<0.05}=1\relax
   \tikzset{insert path={(\pgfutil@tmpC) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 1})}}%
  \else
   \pgfmathsetmacro{\pgfutil@tmpE}{TD("(\pgfutil@tmpc)-(\pgfutil@tmpa)")}%
@@ -1039,18 +1686,18 @@ project/.code args={#1 on #2}{%
   \pgfmathsetmacro{\pgfutil@tmpG}{TD("(\pgfutil@tmpD)-(\pgfutil@tmpC)")}%
   \pgfmathsetmacro{\pgfutil@tmpH}{TD("(\pgfutil@tmpF)x(\pgfutil@tmpG)")}%
   \pgfmathsetmacro{\pgfutil@tmpK}{TD("(\pgfutil@tmpF)x(\pgfutil@tmpE)")}%
-  \pgfmathsetmacro@td@FPU{\pgfutil@tmph}{sqrt(TD("(\pgfutil@tmpH)o(\pgfutil@tmpH)"))}%
   \pgfmathsetmacro@td@FPU{\pgfutil@tmpk}{sqrt(TD("(\pgfutil@tmpK)o(\pgfutil@tmpK)"))}%
-  \ifdim\pgfutil@tmph pt<0.01pt\relax
-   \PackageWarning{3dtools}{The lines do not intersect within the uncertainties. Returning (0,0,0) instead.}%
+  \ifnum\fpeval{\pgfutil@tmpk<0.01}=1\relax
+   \PackageWarning{3dtools}{The lines are (almost) parallel. No intersection inserted.}%
   \else
-   \ifdim\pgfutil@tmpk pt<0.01pt\relax
-	\PackageWarning{3dtools}{The lines do not intersect within the uncertainties. Returning (0,0,0) instead.}%
-   \else
-	\pgfmathsetmacro@td@FPU{\pgfutil@tmpl}{sign(TD("(\pgfutil@tmpH)o(\pgfutil@tmpK)"))*\pgfutil@tmph/\pgfutil@tmpk}%
-	\pgfmathsetmacro{\pgfutil@tmpM}{TD("(\pgfutil@tmpC)+\pgfutil@tmpl*(\pgfutil@tmpE)")}%
-	\tikzset{insert path={(\pgfutil@tmpM) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 1})}}%
-   \fi 
+   % distance of the lines = |G.K|/|K|
+   \pgfmathsetmacro@td@FPU{\pgfutil@tmph}{abs(TD("(\pgfutil@tmpG)o(\pgfutil@tmpK)"))/\pgfutil@tmpk}%
+   \ifnum\fpeval{\pgfutil@tmph>0.01}=1\relax
+    \PackageWarning{3dtools}{The lines are skew (distance \pgfutil@tmph). Inserting the point of #1 closest to #2.}%
+   \fi
+   \pgfmathsetmacro@td@FPU{\pgfutil@tmpl}{TD("(\pgfutil@tmpH)o(\pgfutil@tmpK)")/(\pgfutil@tmpk*\pgfutil@tmpk)}%
+   \pgfmathsetmacro{\pgfutil@tmpM}{TD("(\pgfutil@tmpC)+\pgfutil@tmpl*(\pgfutil@tmpE)")}%
+   \tikzset{insert path={(\pgfutil@tmpM) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 1})}}%
   \fi
  \fi
 \fi
@@ -1127,6 +1774,7 @@ be determined.}%
 \fi
 }}%
 \tikzset{3d/define orthonormal dreibein/.code={%
+\def\tikz@td@dreibein@ok{0}%
 \tikzset{3d/aux keys/.cd,#1}%
 \edef\pgfutil@tmpA{\pgfkeysvalueof{/tikz/3d/aux keys/A}}%
 \edef\pgfutil@tmpB{\pgfkeysvalueof{/tikz/3d/aux keys/B}}%
@@ -1135,10 +1783,11 @@ be determined.}%
 \pgfmathsetmacro{\pgfutil@tmpC}{TD("\pgfutil@tmpC-\pgfutil@tmpA")}%
 \pgfmathsetmacro{\pgfutil@tmpD}{TD("(\pgfutil@tmpB)x(\pgfutil@tmpC)")}%
 \pgfmathsetmacro@td@FPU{\pgfutil@tmpd}{min(1,TD("(\pgfutil@tmpD)o(\pgfutil@tmpD)"))}% changed May 23 2023
-\ifdim\pgfutil@tmpd pt<0.01pt\relax
+\ifnum\fpeval{\pgfutil@tmpd<0.01}=1\relax
 \PackageWarning{3dtools}{The vectors \pgfutil@tmpA, \pgfutil@tmpB\space and 
 \pgfutil@tmpC are too collinear. Cannot determine appropriate plane.}%
 \else
+\def\tikz@td@dreibein@ok{1}%
 \pgfmathsetmacro{\pgfutil@tmpB}{TDunit("(\pgfutil@tmpB)")}% changed May 23 2023
 \pgfmathsetmacro{\pgfutil@tmpD}{TDunit("(\pgfutil@tmpD)")}% changed May 23 2023
 \pgfmathsetmacro{\pgfutil@tmpC}{TD("(\pgfutil@tmpD)x(\pgfutil@tmpB)")}%
@@ -1165,12 +1814,12 @@ tmpcoord1/.initial=3dtoolstmp-1}
 \tikzset{pics/3d/dim line/.style={code={%
   \tikzset{3d/dim line/.cd,#1}%
   \pgfmathsetmacro{\pgfutil@tmpa}{tddistance("\pgfkeysvalueof{/tikz/3d/dim line/A}","\pgfkeysvalueof{/tikz/3d/dim line/B}")}%
-  \ifdim\pgfutil@tmpa pt<0.02pt\relax 
+  \ifnum\fpeval{\pgfutil@tmpa<0.02}=1\relax 
    \message{The points A=\pgfkeysvalueof{/tikz/3d/dim line/A} and B=\pgfkeysvalueof{/tikz/3d/dim line/B} are too close. Cannot draw dim line.}%
   \else 
     \pgfmathsetmacro{\pgfutil@tmpa}{TD("\pgfkeysvalueof{/tikz/3d/dim line/A}-\pgfkeysvalueof{/tikz/3d/dim line/B}x\pgfkeysvalueof{/tikz/3d/dim line/n}")}%
     \pgfmathsetmacro{\pgfutil@tmpb}{TD("(\pgfutil@tmpa)o(\pgfutil@tmpa)")}%
-    \ifdim\pgfutil@tmpb pt<0.02pt\relax
+    \ifnum\fpeval{\pgfutil@tmpb<0.02}=1\relax
       \message{The normal n=\pgfkeysvalueof{/tikz/3d/dim line/n} is either too short or too collinear with A-B=\pgfkeysvalueof{/tikz/3d/dim line/A}-\pgfkeysvalueof{/tikz/3d/dim line/B}. Cannot draw dim line.}%
     \else 
       % \pgfmathsetmacro{\pgfutil@tmpC}{TD("\pgfkeysvalueof{/tikz/3d/dim line/B}-\pgfkeysvalueof{/tikz/3d/dim line/A}x\pgfkeysvalueof{/tikz/3d/dim line/n}")}%
@@ -1242,7 +1891,7 @@ node name/.initial=dim label}
  3d coordinate={(\pgfkeysvalueof{/tikz/3d/circle through 3 points/auxiliary coordinate prefix}n)=(\pgfkeysvalueof{/tikz/3d/circle through 3 points/auxiliary coordinate prefix}a)x(\pgfkeysvalueof{/tikz/3d/circle through 3 points/auxiliary coordinate prefix}b)}
  ];}%
  \pgfmathsetmacro@td@FPU{\lengthn}{sqrt(TD("(\pgfkeysvalueof{/tikz/3d/circle through 3 points/auxiliary coordinate prefix}n)o(\pgfkeysvalueof{/tikz/3d/circle through 3 points/auxiliary coordinate prefix}n)"))}
- \ifdim\lengthn pt<0.02pt\relax
+ \ifnum\fpeval{\lengthn<0.02}=1\relax
    \message{The points are (almost) on a line. Circle cannot be determined.}
   \else
    \pgfmathsetmacro@td@FPU{\tmpradius}{sqrt(TD("(\pgfkeysvalueof{/tikz/3d/circle through 3 points/auxiliary coordinate prefix}a)o(\pgfkeysvalueof{/tikz/3d/circle through 3 points/auxiliary coordinate prefix}a)"))*%
@@ -1280,8 +1929,6 @@ extra/.code={}}%
 \pgfmathsetmacro{\pgfutil@tmpb}{tddistance("\pgfkeysvalueof{/tikz/3d/incircle/A}","\pgfkeysvalueof{/tikz/3d/incircle/C}")}%
 \pgfmathsetmacro{\pgfutil@tmpc}{tddistance("\pgfkeysvalueof{/tikz/3d/incircle/A}","\pgfkeysvalueof{/tikz/3d/incircle/B}")}%
 \pgfmathsetmacro{\pgfutil@tmpd}{(\pgfutil@tmpa+\pgfutil@tmpb+\pgfutil@tmpc)/2}%
-\pgfmathsetmacro{\pgfutil@tmparea}{sqrt(\pgfutil@tmpd*(\pgfutil@tmpd-\pgfutil@tmpa)*(\pgfutil@tmpd-\pgfutil@tmpb)*(\pgfutil@tmpd-\pgfutil@tmpc))}%
-\pgfmathsetmacro{\pgfutil@tmpr}{\pgfutil@tmparea/\pgfutil@tmpd}%
 %\edef\pgfutil@tmpt{\noexpand\tikz@td@parse@coord\pgfkeysvalueof{/tikz/3d/incircle/A}}%
 %\pgfutil@tmpt
 \expanded{\noexpand\tikz@td@parse@coord\pgfkeysvalueof{/tikz/3d/incircle/A}}%
@@ -1300,9 +1947,9 @@ extra/.code={}}%
 \pgfmathsetmacro{\pgfutil@tmp@Cx}{\pgf@X}%
 \pgfmathsetmacro{\pgfutil@tmp@Cy}{\pgf@Y}%
 \pgfmathsetmacro{\pgfutil@tmp@Cz}{\pgf@Z}%
-\pgfmathsetmacro{\pgfutil@tmpIx}{\pgfutil@tmp@Ax*\pgfutil@tmpa+\pgfutil@tmp@Bx*\pgfutil@tmpb+\pgfutil@tmp@Cx*\pgfutil@tmpc)/\pgfutil@tmpd/2}%
-\pgfmathsetmacro{\pgfutil@tmpIy}{\pgfutil@tmp@Ay*\pgfutil@tmpa+\pgfutil@tmp@By*\pgfutil@tmpb+\pgfutil@tmp@Cy*\pgfutil@tmpc)/\pgfutil@tmpd/2}%
-\pgfmathsetmacro{\pgfutil@tmpIz}{\pgfutil@tmp@Az*\pgfutil@tmpa+\pgfutil@tmp@Bz*\pgfutil@tmpb+\pgfutil@tmp@Cz*\pgfutil@tmpc)/\pgfutil@tmpd/2}%
+\pgfmathsetmacro{\pgfutil@tmpIx}{(\pgfutil@tmp@Ax*\pgfutil@tmpa+\pgfutil@tmp@Bx*\pgfutil@tmpb+\pgfutil@tmp@Cx*\pgfutil@tmpc)/\pgfutil@tmpd/2}%
+\pgfmathsetmacro{\pgfutil@tmpIy}{(\pgfutil@tmp@Ay*\pgfutil@tmpa+\pgfutil@tmp@By*\pgfutil@tmpb+\pgfutil@tmp@Cy*\pgfutil@tmpc)/\pgfutil@tmpd/2}%
+\pgfmathsetmacro{\pgfutil@tmpIz}{(\pgfutil@tmp@Az*\pgfutil@tmpa+\pgfutil@tmp@Bz*\pgfutil@tmpb+\pgfutil@tmp@Cz*\pgfutil@tmpc)/\pgfutil@tmpd/2}%
 \path (\pgfutil@tmpIx,\pgfutil@tmpIy,\pgfutil@tmpIz) 
   coordinate (\pgfkeysvalueof{/tikz/3d/incircle/center name})
   [3d/projection of={(\pgfkeysvalueof{/tikz/3d/incircle/center name}) on 
@@ -1325,340 +1972,606 @@ center name/.initial=I,
 A/.initial={(1,0,0)},B/.initial={(0,1,0)},C/.initial={(0,0,1)},
 projection prefix/.initial=tmpp}
 %
+% Circles and arcs in 3d, split where their visibility changes. Vectors are
+% comma lists x,y,z in the coordinates of the current frame.
+% \tikz@td@circle@frame{<normal>}: \tikz@td@kz is the unit normal, \tikz@td@kN
+% the unit screen normal and \tikz@td@kw the length of its component in the
+% plane of the circle; \tikz@td@kx is that component normalized (it points to
+% the part of the circle closest to the viewer) or, if the circle faces the
+% screen (\tikz@td@kw<0.04), any unit vector in the plane; \tikz@td@ky = kz x kx.
+\ExplSyntaxOn
+\cs_new:Npn \__tdtools_vcomb:nnnn #1#2#3#4
+  { \exp_last_unbraced:Ne \__tdtools_vcomb:w { #2 , #4 } \q_stop {#1} {#3} }
+\cs_new:Npn \__tdtools_vcomb:w #1 , #2 , #3 , #4 , #5 , #6 \q_stop #7#8
+  {
+    \fp_eval:n { (#7) * (#1) + (#8) * (#4) } ,
+    \fp_eval:n { (#7) * (#2) + (#8) * (#5) } ,
+    \fp_eval:n { (#7) * (#3) + (#8) * (#6) }
+  }
+\cs_new:Npn \__tdtools_vcross:nn #1#2
+  { \exp_last_unbraced:Ne \__tdtools_vcross:w { #1 , #2 } \q_stop }
+\cs_new:Npn \__tdtools_vcross:w #1 , #2 , #3 , #4 , #5 , #6 \q_stop
+  {
+    \fp_eval:n { (#2) * (#6) - (#3) * (#5) } ,
+    \fp_eval:n { (#3) * (#4) - (#1) * (#6) } ,
+    \fp_eval:n { (#1) * (#5) - (#2) * (#4) }
+  }
+\cs_new:Npn \__tdtools_vnorm:n #1 { sqrt ( \__tdtools_dot:nn {#1} {#1} ) }
+\cs_new_protected:Npn \__tdtools_vunit:Nn #1#2
+  { \tl_set:Ne #1 { \__tdtools_vcomb:nnnn { 1 / \__tdtools_vnorm:n {#2} } {#2} { 0 } {#2} } }
+\cs_generate_variant:Nn \__tdtools_vunit:Nn { Ne }
+\cs_new_protected:Npn \tikz@td@circle@frame #1
+  {
+    \__tdtools_vunit:Ne \tikz@td@kz {#1}
+    \__tdtools_vunit:Ne \tikz@td@kN { \__tdtools_nx: , \__tdtools_ny: , \__tdtools_nz: }
+    \tl_set:Ne \tikz@td@kx
+      {
+        \__tdtools_vcomb:nnnn { 1 } { \tikz@td@kN }
+          { - ( \__tdtools_dot:nn { \tikz@td@kN } { \tikz@td@kz } ) } { \tikz@td@kz }
+      }
+    \tl_set:Ne \tikz@td@kw { \fp_eval:n { \__tdtools_vnorm:n { \tikz@td@kx } } }
+    \fp_compare:nNnT { \tikz@td@kw } < { 0.04 }
+      { \pgfmathsetmacro \tikz@td@kx { normalcandidate ( \tikz@td@kz ) } }
+    \__tdtools_vunit:Ne \tikz@td@kx { \tikz@td@kx }
+    \tl_set:Ne \tikz@td@ky { \__tdtools_vcross:nn { \tikz@td@kz } { \tikz@td@kx } }
+  }
+% \tikz@td@circle@arcs{<c>}{<start>}{<end>}{<u>}: after \tikz@td@circle@frame,
+% calls \tikz@td@circle@seg{<a>}{<b>}{<visible>} for the parts of the arc
+% from <start> to <end> (degrees from the direction <u> projected into the
+% plane, towards kz x u) with the angle t from kx in [<a>,<b>], where <visible>
+% is 1 if cos t > <c>. A full circle starts at a change of visibility.
+\seq_new:N \l__tdtools_cuts_seq
+\tl_new:N \l__tdtools_segs_tl
+\tl_new:N \l__tdtools_prev_tl
+\fp_new:N \l__tdtools_ka_fp
+\fp_new:N \l__tdtools_kb_fp
+\fp_new:N \l__tdtools_kf_fp
+\cs_new_protected:Npn \tikz@td@circle@arcs #1#2#3#4
+  {
+    \fp_compare:nNnTF { abs (#1) } < { 1 }
+      { \fp_set:Nn \l__tdtools_kf_fp { acosd (#1) } }
+      { \fp_set:Nn \l__tdtools_kf_fp { 0 } }
+    \fp_compare:nNnTF { (#3) - (#2) } < { 359.999 }
+      {
+        \tl_set:Ne \l__tdtools_tmp_tl
+          { \__tdtools_vcomb:nnnn { 1 } {#4} { - ( \__tdtools_dot:nn {#4} { \tikz@td@kz } ) } { \tikz@td@kz } }
+        \fp_compare:nNnT { \__tdtools_vnorm:n { \l__tdtools_tmp_tl } } < { 0.001 }
+          { \tl_set_eq:NN \l__tdtools_tmp_tl \tikz@td@kx }
+        \fp_set:Nn \l__tdtools_ka_fp
+          {
+            atand ( \__tdtools_dot:nn { \l__tdtools_tmp_tl } { \tikz@td@ky } ,
+              \__tdtools_dot:nn { \l__tdtools_tmp_tl } { \tikz@td@kx } )
+          }
+        \fp_set:Nn \l__tdtools_kb_fp { \l__tdtools_ka_fp + (#3) }
+        \fp_add:Nn \l__tdtools_ka_fp {#2}
+      }
+      {
+        \fp_set_eq:NN \l__tdtools_ka_fp \l__tdtools_kf_fp
+        \fp_set:Nn \l__tdtools_kb_fp { \l__tdtools_ka_fp + 360 }
+      }
+    \seq_clear:N \l__tdtools_cuts_seq
+    \fp_compare:nNnT { 0 < \l__tdtools_kf_fp < 180 } = { 1 }
+      {
+        \int_step_inline:nnn
+          { \fp_eval:n { floor ( ( \l__tdtools_ka_fp - 180 ) / 360 ) } }
+          { \fp_eval:n { ceil ( ( \l__tdtools_kb_fp + 180 ) / 360 ) } }
+          {
+            \__tdtools_cut:n { 360 * ##1 - \l__tdtools_kf_fp }
+            \__tdtools_cut:n { 360 * ##1 + \l__tdtools_kf_fp }
+          }
+      }
+    \seq_sort:Nn \l__tdtools_cuts_seq
+      { \fp_compare:nNnTF {##1} > {##2} { \sort_return_swapped: } { \sort_return_same: } }
+    \seq_put_left:Ne \l__tdtools_cuts_seq { \fp_use:N \l__tdtools_ka_fp }
+    \seq_put_right:Ne \l__tdtools_cuts_seq { \fp_use:N \l__tdtools_kb_fp }
+    \tl_set:Ne \tikz@td@kf { \fp_use:N \l__tdtools_kf_fp }
+    \tl_set:Ne \tikz@td@kga { \fp_use:N \l__tdtools_ka_fp }
+    \tl_set:Ne \tikz@td@kgb { \fp_use:N \l__tdtools_kb_fp }
+    \tl_clear:N \l__tdtools_segs_tl
+    \tl_clear:N \l__tdtools_prev_tl
+    \seq_map_inline:Nn \l__tdtools_cuts_seq
+      {
+        \tl_if_empty:NF \l__tdtools_prev_tl
+          {
+            \fp_compare:nNnT { ##1 - \l__tdtools_prev_tl } > { 0.001 }
+              {
+                \tl_put_right:Ne \l__tdtools_segs_tl
+                  {
+                    \exp_not:N \tikz@td@circle@seg { \l__tdtools_prev_tl } {##1}
+                      { \fp_compare:nNnTF { cosd ( ( \l__tdtools_prev_tl + ##1 ) / 2 ) } > {#1} { 1 } { 0 } }
+                  }
+              }
+          }
+        \tl_set:Nn \l__tdtools_prev_tl {##1}
+      }
+    \tl_use:N \l__tdtools_segs_tl
+  }
+\cs_new_protected:Npn \__tdtools_cut:n #1
+  {
+    \fp_compare:nNnT { \l__tdtools_ka_fp + 0.001 < #1 < \l__tdtools_kb_fp - 0.001 } = { 1 }
+      { \seq_put_right:Ne \l__tdtools_cuts_seq { \fp_eval:n {#1} } }
+  }
+\ExplSyntaxOff
+% \tikz@td@circle@draw{<center>}{<r>}{<c>}{<start>}{<end>}{<u>}: after
+% \tikz@td@circle@frame, draws the arc of radius <r> around <center> (see
+% \tikz@td@circle@arcs) in the local frame kx, ky, kz. The disk is filled with
+% \tikz@td@kfill first; visible parts use \tikz@td@kvis on layer
+% \tikz@td@kvlay, the others \tikz@td@khid on \tikz@td@khlay. Every part is a
+% piece of its own.
+\def\tikz@td@circle@draw#1#2#3#4#5#6{%
+  \pgfmathsetmacro\tikz@td@kr{#2}%
+  \let\tikz@td@kext\tikz@td@kr
+  % canvas images of the frame vectors (x={(<3d point>)} would include shifts)
+  \tikz@scan@one@point\pgfutil@firstofone(\tikz@td@kx)\relax
+  \edef\tikz@td@kcx{\the\pgf@x,\the\pgf@y}%
+  \tikz@scan@one@point\pgfutil@firstofone(\tikz@td@ky)\relax
+  \edef\tikz@td@kcy{\the\pgf@x,\the\pgf@y}%
+  \tikz@scan@one@point\pgfutil@firstofone(\tikz@td@kz)\relax
+  \edef\tikz@td@kcz{\the\pgf@x,\the\pgf@y}%
+  \begin{scope}[shift={(#1)},x/.expanded={(\tikz@td@kcx)},
+    y/.expanded={(\tikz@td@kcy)},z/.expanded={(\tikz@td@kcz)}]
+    \tikz@td@piece{(0,0,0)}{\edef\pgfutil@tmpa{\noexpand\path[\tikz@td@kfill]}%
+      \pgfutil@tmpa (0,0) circle[radius=\tikz@td@kr];}%
+    \tikz@td@circle@arcs{#3}{#4}{#5}{#6}%
+  \end{scope}}%
+\def\tikz@td@circle@seg#1#2#3{%
+  \ifnum#3=1 \edef\pgfutil@tmpb{\tikz@td@kvlay}\let\tikz@td@kst\tikz@td@kvis
+  \else\edef\pgfutil@tmpb{\tikz@td@khlay}\let\tikz@td@kst\tikz@td@khid\fi
+  % \pgfonlayer resets the line width, so enter it only to change the layer
+  \ifx\pgfutil@tmpb\pgfonlayer@name\def\tikz@td@klayer{\begingroup}\def\tikz@td@kendlayer{\endgroup}%
+  \else\def\tikz@td@klayer{\pgfonlayer{\pgfutil@tmpb}}\def\tikz@td@kendlayer{\endpgfonlayer}\fi
+  \tikz@td@klayer
+  \def\tikz@td@kcls{#3}%
+  \iftikz@td@scene\def\pgfutil@tmpa{1}\else
+    \ifx\tikz@td@kgA\pgfutil@empty\def\pgfutil@tmpa{0}\else\def\pgfutil@tmpa{1}\fi
+  \fi
+  \ifnum\pgfutil@tmpa=0
+    % one path
+    \edef\pgfutil@tmpa{\noexpand\draw[\tikz@td@kst]}%
+    \tikz@td@circle@arc{#1}{#2}{#1}{#2}%
+  \else
+    % sub-arcs: in a scene each is a piece, with the depth of its cell (the cells
+    % are \tikz@td@kgs degrees wide, start at the angle 0 and end where the
+    % visibility changes), so that pieces of coinciding circles tie; with a color
+    % gradient they are at most \tikz@td@kgg degrees long. Only the last one keeps
+    % the arrow tips, and it spans at least 10 degrees, so that it can be
+    % shortened for them.
+    \ifx\tikz@td@kgA\pgfutil@empty\let\tikz@td@kgh\tikz@td@kgs\else\let\tikz@td@kgh\tikz@td@kgg\fi
+    \ifdim\fpeval{\tikz@td@kgb-(#2)}pt<0.001pt
+      \edef\tikz@td@kge{\fpeval{#2-min(#2-(#1),max(10,\tikz@td@kgh))}}%
+    \else\def\tikz@td@kge{#2}\fi
+    \def\tikz@td@kta{#1}%
+    \tikz@td@circle@sub{#2}%
+  \fi
+  \tikz@td@kendlayer}%
+% the sub-arcs from \tikz@td@kta on: up to \tikz@td@kge at multiples of
+% \tikz@td@kgh, then up to #1
+\def\tikz@td@circle@sub#1{%
+  \ifdim\tikz@td@kta pt<\fpeval{\tikz@td@kge-0.001}pt
+    \edef\tikz@td@ktb{\fpeval{min(\tikz@td@kge,(floor(round(\tikz@td@kta/\tikz@td@kgh,6))+1)*\tikz@td@kgh)}}%
+  \else
+    \edef\tikz@td@ktb{#1}%
+  \fi
+  \ifx\tikz@td@kgA\pgfutil@empty\else
+    \edef\pgfutil@tmpc{\fpeval{round(100*((\tikz@td@kta+\tikz@td@ktb)/2-\tikz@td@kga)/(\tikz@td@kgb-\tikz@td@kga),2)}}%
+    \colorlet{tikz@td@kgc}{\tikz@td@kgB!\pgfutil@tmpc!\tikz@td@kgA}%
+  \fi
+  \edef\pgfutil@tmpa{\noexpand\draw[\tikz@td@kst,/tikz/3d/joint caps
+    \ifx\tikz@td@kgA\pgfutil@empty\else,color=tikz@td@kgc\fi
+    \ifdim\fpeval{\tikz@td@kgb-\tikz@td@ktb}pt<0.001pt \else,arrows=-\fi]}%
+  % the cell of the middle of the sub-arc
+  \edef\tikz@td@kcm{\fpeval{(\tikz@td@kta+\tikz@td@ktb)/2}}%
+  \edef\tikz@td@kca{\fpeval{floor(\tikz@td@kcm/\tikz@td@kgs)*\tikz@td@kgs}}%
+  \edef\tikz@td@kcb{\fpeval{\tikz@td@kca+\tikz@td@kgs}}%
+  \ifdim\fpeval{0<\tikz@td@kf<180}pt=1pt
+    \ifnum\tikz@td@kcls=1
+      \edef\pgfutil@tmpc{\fpeval{round(\tikz@td@kcm/360)*360}}%
+      \edef\tikz@td@kca{\fpeval{max(\tikz@td@kca,\pgfutil@tmpc-\tikz@td@kf)}}%
+      \edef\tikz@td@kcb{\fpeval{min(\tikz@td@kcb,\pgfutil@tmpc+\tikz@td@kf)}}%
+    \else
+      \edef\pgfutil@tmpc{\fpeval{floor((\tikz@td@kcm-\tikz@td@kf)/360)*360}}%
+      \edef\tikz@td@kca{\fpeval{max(\tikz@td@kca,\pgfutil@tmpc+\tikz@td@kf)}}%
+      \edef\tikz@td@kcb{\fpeval{min(\tikz@td@kcb,\pgfutil@tmpc+360-\tikz@td@kf)}}%
+    \fi
+  \fi
+  \tikz@td@circle@arc{\tikz@td@kta}{\tikz@td@ktb}{\tikz@td@kca}{\tikz@td@kcb}%
+  \let\tikz@td@kta\tikz@td@ktb
+  \ifdim\tikz@td@kta pt<\fpeval{#1-0.001}pt\expandafter\tikz@td@circle@sub\expandafter{#1}\fi}%
+% \tikz@td@circle@arc{<a>}{<b>}{<c>}{<d>}: \pgfutil@tmpa (a \draw command)
+% applied to the arc from <a> to <b>, as a piece at the depth of the centroid
+% of the arc from <c> to <d>. Lines on a sphere cover each other only where
+% they cross, at equal depth: the visible ones all go just in front of the
+% front shell of the sphere (\tikz@td@kfront), the others just in front of
+% the back shell (\tikz@td@kback), in the order of the code.
+\def\tikz@td@circle@arc#1#2#3#4{%
+  \ifdim\fpeval{#4-(#3)}pt>359.999pt
+    \def\pgfutil@tmpc{(0,0,0)}%
+  \else
+    \edef\pgfutil@tmpc{(\fpeval{\tikz@td@kr*(sind(#4)-sind(#3))/((#4-(#3))*pi/180)},%
+      \fpeval{\tikz@td@kr*(cosd(#3)-cosd(#4))/((#4-(#3))*pi/180)},0)}%
+  \fi
+  \ifx\tikz@td@kfront\relax\else
+    \ifnum\tikz@td@kcls=1 \edef\pgfutil@tmpc{\fpeval{\tikz@td@kfront+0.01}}%
+    \else\edef\pgfutil@tmpc{\fpeval{\tikz@td@kback+0.01}}\fi
+  \fi
+  \ifdim\fpeval{#2-(#1)}pt>359.999pt
+    \expandafter\tikz@td@piece\expandafter{\pgfutil@tmpc}{\pgfutil@tmpa (0,0) circle[radius=\tikz@td@kr];}%
+  \else
+    \expandafter\tikz@td@piece\expandafter{\pgfutil@tmpc}{\pgfutil@tmpa (#1:\tikz@td@kr)
+      arc[start angle=#1,end angle=#2,radius=\tikz@td@kr];}%
+  \fi}%
+\let\tikz@td@kfront\relax
+\def\tikz@td@circle@gradient#1{%
+  \edef\tikz@td@kgA{\pgfkeysvalueof{#1/start color}}%
+  \edef\tikz@td@kgB{\pgfkeysvalueof{#1/end color}}%
+  \ifx\tikz@td@kgB\pgfutil@empty\let\tikz@td@kgB\tikz@td@kgA\fi
+  \pgfmathsetmacro\tikz@td@kgs{\pgfkeysvalueof{#1/segment angle}}%
+  \pgfmathsetmacro\tikz@td@kgg{min(\tikz@td@kgs,\pgfkeysvalueof{#1/gradient angle})}}%
 \tikzset{pics/3d/circle on sphere/.style={code={%
  \tikzset{3d/circle on sphere/.cd,#1}%
- \edef\pgfutil@tmpR{\pgfkeysvalueof{/tikz/3d/circle on sphere/R}}%
- \edef\pgfutil@tmpC{\pgfkeysvalueof{/tikz/3d/circle on sphere/C}}%
- \edef\pgfutil@tmpP{\pgfkeysvalueof{/tikz/3d/circle on sphere/P}}%
- \edef\pgfutil@tmpn{\pgfkeysvalueof{/tikz/3d/circle on sphere/n}}%
- \edef\pgfutil@tmpPname{\pgfkeysvalueof{/tikz/3d/circle on sphere/auxiliary coordinate prefix}P}%
- \pgfmathsetmacro{\pgfutil@tmpC}{TD("\pgfutil@tmpC")}%
- \pgfmathsetmacro{\pgfutil@tmpP}{TD("\pgfutil@tmpP")}%
- \pgfmathsetmacro{\pgfutil@tmpn}{TD("\pgfutil@tmpn")}%
- \pgfmathsetmacro{\pgfutil@tmpd}{sqrt(TD("(\pgfutil@tmpP)-(\pgfutil@tmpC)o(\pgfutil@tmpP)-(\pgfutil@tmpC)"))}%
- \ifdim\pgfutil@tmpd pt>0.02pt\relax
-  % compute a new normal
-  \pgfmathsetmacro{\pgfutil@tmpn}{TD("(\pgfutil@tmpP)-(\pgfutil@tmpC)")}%
+ \def\pgfutil@tmpo##1{\pgfkeysvalueof{/tikz/3d/circle on sphere/##1}}%
+ \pgfmathsetmacro{\tikz@td@kR}{\pgfutil@tmpo{R}}%
+ \pgfmathsetmacro{\tikz@td@kC}{TD("\pgfutil@tmpo{C}")}%
+ \pgfmathsetmacro{\tikz@td@kP}{TD("\pgfutil@tmpo{P}")}%
+ \pgfmathsetmacro{\tikz@td@kn}{TD("\pgfutil@tmpo{n}")}%
+ \edef\pgfutil@tmpa{\pgfutil@tmpo{latitude}}%
+ \ifx\pgfutil@tmpa\pgfutil@empty\else
+  \def\tikz@td@kn{0,0,1}%
+  \edef\tikz@td@kP{\csname __tdtools_vcomb:nnnn\endcsname{1}{\tikz@td@kC}%
+   {\tikz@td@kR*sind(\pgfutil@tmpa)}{0,0,1}}%
  \fi
- % normalize the normal
- \pgfmathsetmacro{\pgfutil@tmpa}{sqrt(TD("(\pgfutil@tmpn)o(\pgfutil@tmpn)"))}%
- \ifdim\pgfutil@tmpa pt<0.02pt\relax
-  \PackageWarning{3dtools}{Chosen normal is too short.}%    
- \else
- \pgfmathtruncatemacro{\pgfutil@tmpb}{(\pgfutil@tmpd<\pgfutil@tmpR?1:0)} 
- \ifnum\pgfutil@tmpb=0
-  \PackageWarning{3dtools}{Circle center is not inside the sphere.}
- \else 
-  \pgfmathsetmacro{\pgfutil@tmpr}{sqrt(\pgfutil@tmpR*\pgfutil@tmpR-\pgfutil@tmpd*\pgfutil@tmpd)}%
-  \pgfmathsetmacro{\pgfutil@tmpa}{1/\pgfutil@tmpa}%
-  \pgfmathsetmacro{\pgfutil@tmpz}{TD("\pgfutil@tmpa*(\pgfutil@tmpn)")}%
-  \path[overlay] (nscreenx,nscreeny,nscreenz) coordinate (nscreen)
-	[3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ez}=(\pgfutil@tmpz)},
-	3d coordinate/.expanded={(\pgfutil@tmpPname)=(\pgfutil@tmpP)}];%
-  \pgfmathsetmacro{\pgfutil@tmpy}{TD("\pgfkeysvalueof{/tikz/3d/aux keys/ez}x(nscreen)")}%
-  \pgfmathsetmacro{\pgfutil@tmpa}{sqrt(TD("(\pgfutil@tmpy)o(\pgfutil@tmpy)"))}%
-  \ifdim\pgfutil@tmpa pt<0.04pt%
-   %\typeout{(n) is (almost) parallel to normal on screen.}%
-   \pgfmathsetmacro{\pgfutil@tmpx}{normalcandidate(\pgfutil@tmpz)}%
-   \pgfmathsetmacro{\pgfutil@tmpy}{TD("(\pgfutil@tmpz)x(\pgfutil@tmpx)")}
-   \path[overlay] 
-	[3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ex}=(\pgfutil@tmpx)},
-	 3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ey}=(\pgfutil@tmpy)}];
-   \pgfmathtruncatemacro{\pgfutil@tmpa}{(TD("\pgfkeysvalueof{/tikz/3d/aux keys/ez}o(\pgfutil@tmpn)")<0?0:1)}%   
-   \begin{scope}[x/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ex}},%
-   	y/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ey}},%
-	z/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ez}},%
-	shift={(\pgfutil@tmpPname)}]
-	\ifcase\pgfutil@tmpa
-	 % hidden
-	 \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/circle on sphere/back layer}}%
-	  \draw[3d/hidden]  circle[radius=\pgfutil@tmpr];
-	 \end{pgfonlayer}%
-	\or
-	 % visible
-	 \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/circle on sphere/fore layer}}%
-	  \draw[3d/visible] circle[radius=\pgfutil@tmpr];
-	 \end{pgfonlayer}% 
-	\fi
-   \end{scope}
-  \else% normal not collinear with n_screen 
-   \pgfmathsetmacro{\pgfutil@tmpa}{1/\pgfutil@tmpa}%
-   \pgfmathsetmacro{\pgfutil@tmpy}{TD("\pgfutil@tmpa*(\pgfutil@tmpy)")}%
-   \pgfmathsetmacro{\pgfutil@tmpx}{TD("(\pgfutil@tmpy)x(\pgfutil@tmpz)")}%
-   \pgfmathsetmacro{\pgfutil@tmps}{TD("(nscreen)")}%
-   \pgfmathsetmacro{\pgfutil@tmpp}{TD("\pgfkeysvalueof{/tikz/3d/aux keys/ez}o(nscreen)")}%
-   \pgfmathsetmacro{\pgfutil@tmpo}{sqrt(1-\pgfutil@tmpp*\pgfutil@tmpp)}%
-   \pgfmathsetmacro{\pgfutil@tmpa}{atan2(-1*\pgfutil@tmpp,\pgfutil@tmpo)}%
-   \pgfmathsetmacro{\pgfutil@tmpb}{screendepth(\pgfutil@tmpP)}%
-   \pgfmathsetmacro{\pgfutil@tmpc}{screendepth(\pgfutil@tmpC)}%
-   \path[overlay,
-		3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ex}=(\pgfutil@tmpx)},
-		3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ey}=(\pgfutil@tmpy)}];%
-%    \typeout{\pgfkeysvalueof{/tikz/3d/aux keys/ex}=(\pgfutil@tmpx), 
-%    	\pgfkeysvalueof{/tikz/3d/aux keys/ey}=(\pgfutil@tmpy), 
-% 	\pgfkeysvalueof{/tikz/3d/aux keys/ez}=(\pgfutil@tmpz), n_screen=(\pgfutil@tmps)}%
-   \begin{scope}[x/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ex}},%
-   	 y/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ey}},%
-	 z/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ez}},%
-	 shift={(\pgfutil@tmpPname)}]  
-    \pgfmathtruncatemacro{\pgfutil@tmpi}{(abs(\pgfutil@tmpr*cos(\pgfutil@tmpa))>abs(\pgfutil@tmpb-\pgfutil@tmpc)?1:0)}% 
- 	\ifcase\pgfutil@tmpi
-% 	  % only visible or only hidden
- 	 \pgfmathtruncatemacro{\pgfutil@tmpj}{(\pgfutil@tmpb<\pgfutil@tmpc?0:1)}%
- 	 \ifcase\pgfutil@tmpj
-% 	   % hidden
-      \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/circle on sphere/back layer}}%
- 	   \draw[3d/hidden]  circle[radius=\pgfutil@tmpr];
-	  \end{pgfonlayer}%	
- 	 \or
-% 	   % visible
-	  \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/circle on sphere/fore layer}}%
- 	   \draw[3d/visible]  circle[radius=\pgfutil@tmpr];
-	  \end{pgfonlayer}%	
- 	 \fi
- 	\or
-% 	  % mixed
-	 \pgfmathsetmacro{\pgfutil@tmpf}{abs(acos((\pgfutil@tmpc-\pgfutil@tmpb)/\pgfutil@tmpr/cos(\pgfutil@tmpa))}%
-	 \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/circle on sphere/back layer}}%
-	  \draw[3d/hidden]  (\pgfutil@tmpf:\pgfutil@tmpr) arc[start angle=\pgfutil@tmpf,
-	 	end angle=360-\pgfutil@tmpf,radius=\pgfutil@tmpr];
-     \end{pgfonlayer}%
-	 \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/circle on sphere/fore layer}}%
-	  \draw[3d/visible]  (\pgfutil@tmpf:\pgfutil@tmpr) arc[start angle=\pgfutil@tmpf,
-	 	end angle=-\pgfutil@tmpf,radius=\pgfutil@tmpr];
-	 \end{pgfonlayer}%	
- 	\fi
-   \end{scope}
-   \fi	
+ \edef\pgfutil@tmpa{\pgfutil@tmpo{longitude}}%
+ \ifx\pgfutil@tmpa\pgfutil@empty\else
+  \edef\tikz@td@kn{\fpeval{-sind(\pgfutil@tmpa)},\fpeval{cosd(\pgfutil@tmpa)},0}%
+  \let\tikz@td@kP\tikz@td@kC
+ \fi
+ \edef\pgfutil@tmpb{\csname __tdtools_vcomb:nnnn\endcsname{1}{\tikz@td@kP}{-1}{\tikz@td@kC}}%
+ \edef\pgfutil@tmpd{\fpeval{sqrt(\csname __tdtools_dot:nn\endcsname{\pgfutil@tmpb}{\pgfutil@tmpb})}}%
+ \ifdim\pgfutil@tmpd pt>0.02pt\relax\let\tikz@td@kn\pgfutil@tmpb\fi
+ \ifdim\fpeval{\csname __tdtools_dot:nn\endcsname{\tikz@td@kn}{\tikz@td@kn}}pt<0.0004pt\relax
+  \PackageWarning{3dtools}{Chosen normal is too short.}%
+ \else\ifdim\pgfutil@tmpd pt<\tikz@td@kR pt\relax
+  \pgfmathsetmacro{\tikz@td@kr}{sqrt(\tikz@td@kR*\tikz@td@kR-\pgfutil@tmpd*\pgfutil@tmpd)}%
+  \tikz@td@circle@frame{\tikz@td@kn}%
+  % the coordinates (ex), (ey), (ez), (nscreen) and (<prefix>P)
+  \path[overlay,3d coordinate/.expanded={(nscreen)=(\tikz@td@kN)},
+   3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ex}=(\tikz@td@kx)},
+   3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ey}=(\tikz@td@ky)},
+   3d coordinate/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ez}=(\tikz@td@kz)},
+   3d coordinate/.expanded={(\pgfutil@tmpo{auxiliary coordinate prefix}P)=(\tikz@td@kP)}];%
+  % visible where the depth exceeds the one of the center of the sphere
+  \edef\pgfutil@tmpc{\fpeval{\csname __tdtools_dot:nn\endcsname{\pgfutil@tmpb}{\tikz@td@kN}}}%
+  \ifdim\tikz@td@kw pt<0.04pt\relax
+   \ifdim\pgfutil@tmpc pt<0pt\def\pgfutil@tmpc{2}\else\def\pgfutil@tmpc{-2}\fi
+  \else
+   \edef\pgfutil@tmpc{\fpeval{-\pgfutil@tmpc/(\tikz@td@kr*\tikz@td@kw)}}%
   \fi
- \fi  
+  \def\tikz@td@kvis{/tikz/3d/visible}\def\tikz@td@khid{/tikz/3d/hidden}%
+  \def\tikz@td@knosphere{1}%
+  \tikz@td@circle@gradient{/tikz/3d/circle on sphere}%
+  % in a scene, the parts lie on the front and back shells of the sphere
+  % (3d/sphere)
+  \edef\pgfutil@tmpa{(\csname __tdtools_vcomb:nnnn\endcsname{1}{\tikz@td@kC}{\tikz@td@kR}{\tikz@td@kN})}%
+  \expandafter\tikz@td@depthof\expandafter{\pgfutil@tmpa}%
+  \let\tikz@td@kfront\tikz@td@depthval
+  \edef\pgfutil@tmpa{(\csname __tdtools_vcomb:nnnn\endcsname{1}{\tikz@td@kC}{-\tikz@td@kR}{\tikz@td@kN})}%
+  \expandafter\tikz@td@depthof\expandafter{\pgfutil@tmpa}%
+  \let\tikz@td@kback\tikz@td@depthval
+  \def\tikz@td@kfill{/tikz/3d/circle on sphere/fill}%
+  \edef\tikz@td@kvlay{\pgfutil@tmpo{fore layer}}\edef\tikz@td@khlay{\pgfutil@tmpo{back layer}}%
+  \pgfmathsetmacro{\tikz@td@ku}{TD("\pgfutil@tmpo{u}")}%
+  \tikz@td@circle@draw{\tikz@td@kP}{\tikz@td@kr}{\pgfutil@tmpc}%
+   {\pgfutil@tmpo{start angle}}{\pgfutil@tmpo{end angle}}{\tikz@td@ku}%
+ \else
+  \PackageWarning{3dtools}{Circle center is not inside the sphere.}%
+ \fi\fi
 }},3d/circle on sphere/.cd,C/.initial={(0,0,0)},
 	P/.initial={(0,0,0)},R/.initial=1,%
 	n/.initial={(0,0,1)},auxiliary coordinate prefix/.initial=tmp,%
-	fore layer/.initial=main,back layer/.initial=main}
+	fore layer/.initial=main,back layer/.initial=main,%
+	latitude/.initial=,longitude/.initial=,fill/.style={},%
+	start angle/.initial=0,end angle/.initial=360,u/.initial={(1,0,0)},%
+	start color/.initial=,end color/.initial=,segment angle/.initial=360,gradient angle/.initial=2}
+% a circle (or arc) around the pic position, split into the half closer to
+% the viewer (3d/circle/front) and the other one (3d/circle/back)
+\tikzset{pics/3d/circle/.style={code={%
+ \tikzset{3d/circle/.cd,#1}%
+ \def\pgfutil@tmpo##1{\pgfkeysvalueof{/tikz/3d/circle/##1}}%
+ \pgfmathsetmacro{\tikz@td@kn}{TD("\pgfutil@tmpo{n}")}%
+ \pgfmathsetmacro{\tikz@td@ku}{TD("\pgfutil@tmpo{u}")}%
+ \tikz@td@circle@frame{\tikz@td@kn}%
+ \ifdim\tikz@td@kw pt<0.04pt\relax\def\pgfutil@tmpc{-2}\else\def\pgfutil@tmpc{0}\fi
+ \def\tikz@td@kvis{/tikz/3d/circle/front}\def\tikz@td@khid{/tikz/3d/circle/back}%
+ \tikz@td@circle@gradient{/tikz/3d/circle}%
+ \def\tikz@td@kfill{/tikz/3d/circle/fill}%
+ \def\tikz@td@kvlay{main}\def\tikz@td@khlay{main}%
+ \tikz@td@circle@draw{0,0,0}{\pgfutil@tmpo{r}}{\pgfutil@tmpc}%
+  {\pgfutil@tmpo{start angle}}{\pgfutil@tmpo{end angle}}{\tikz@td@ku}%
+}},3d/circle/.cd,r/.initial=1,n/.initial={(0,0,1)},u/.initial={(1,0,0)},%
+	start angle/.initial=0,end angle/.initial=360,%
+	front/.style={},back/.style={},fill/.style={},%
+	start color/.initial=,end color/.initial=,segment angle/.initial=360,gradient angle/.initial=2}
 %
+% a sphere of radius 3d/sphere/R around the pic position, painted with
+% 3d/sphere/shell (on the screen) and outlined with 3d/sphere/outline. In a
+% scene the shell is painted twice, as a back and a front shell, so that what
+% is inside the sphere lies between them (for a translucent sphere the
+% opacity of the shell applies to each one), and the outline right after the
+% back shell.
+\tikzset{pics/3d/sphere/.style={code={%
+ \tikzset{3d/sphere/.cd,#1}%
+ \pgfmathsetmacro{\tikz@td@kR}{\pgfkeysvalueof{/tikz/3d/sphere/R}}%
+ \let\tikz@td@kext\tikz@td@kR
+ \def\tikz@td@knosphere{1}%
+ \pgfmathsetmacro{\tikz@td@kN}{TDunit("(nscreenx,nscreeny,nscreenz)")}%
+ % in a scene, the sphere places the pieces inside, on and around it:
+ % {x}{y}{depth of the center}{radius}{front depth}{back depth}
+ \iftikz@td@scene
+  \tikz@td@depthof{(0,0,0)}\let\tikz@td@kc\tikz@td@depthpt\let\tikz@td@kcd\tikz@td@depthval
+  \edef\pgfutil@tmpa{(\csname __tdtools_vcomb:nnnn\endcsname{\tikz@td@kR}{\tikz@td@kN}{0}{\tikz@td@kN})}%
+  \expandafter\tikz@td@depthof\expandafter{\pgfutil@tmpa}\let\tikz@td@kfd\tikz@td@depthval
+  \edef\pgfutil@tmpa{(\csname __tdtools_vcomb:nnnn\endcsname{-\tikz@td@kR}{\tikz@td@kN}{0}{\tikz@td@kN})}%
+  \expandafter\tikz@td@depthof\expandafter{\pgfutil@tmpa}\let\tikz@td@kbd\tikz@td@depthval
+  \expandafter\tikz@td@sphere@gput\expandafter{\expandafter\tikz@td@sphere@data\tikz@td@kc}%
+ \fi
+ % back shell, then the outline (same depth), so that all the rest covers it
+ \edef\pgfutil@tmpa{(\csname __tdtools_vcomb:nnnn\endcsname{-\tikz@td@kR}{\tikz@td@kN}{0}{\tikz@td@kN})}%
+ \expandafter\tikz@td@piece\expandafter{\pgfutil@tmpa}{%
+  \path[/tikz/3d/sphere/shell,/tikz/3d/screen coords] (0,0) circle[radius=\tikz@td@kR];}%
+ \expandafter\tikz@td@piece\expandafter{\pgfutil@tmpa}{%
+  \path[/tikz/3d/sphere/outline,/tikz/3d/screen coords] (0,0) circle[radius=\tikz@td@kR];}%
+ \iftikz@td@scene
+  \edef\pgfutil@tmpa{(\csname __tdtools_vcomb:nnnn\endcsname{\tikz@td@kR}{\tikz@td@kN}{0}{\tikz@td@kN})}%
+  \expandafter\tikz@td@piece\expandafter{\pgfutil@tmpa}{%
+   \path[/tikz/3d/sphere/shell,/tikz/3d/screen coords] (0,0) circle[radius=\tikz@td@kR];}%
+ \fi
+}},3d/sphere/.cd,R/.initial=1,shell/.style={ball color=white},outline/.style={draw}}
+\def\tikz@td@sphere@data#1#2#3{{#1}{#2}{\tikz@td@kcd}{\fpeval{\tikz@td@kfd-\tikz@td@kcd}}{\tikz@td@kfd}{\tikz@td@kbd}}%
+% a point on a sphere: a node with 3d/point on sphere/front (and front text)
+% if the point is on the side of the sphere that faces the viewer, else with
+% back (and back text)
+\tikzset{pics/3d/point on sphere/.style={code={%
+ \tikzset{3d/point on sphere/.cd,#1}%
+ \def\pgfutil@tmpo##1{\pgfkeysvalueof{/tikz/3d/point on sphere/##1}}%
+ \pgfmathsetmacro{\tikz@td@kC}{TD("\pgfutil@tmpo{C}")}%
+ \pgfmathsetmacro{\tikz@td@kP}{TD("\pgfutil@tmpo{P}")}%
+ \pgfmathsetmacro{\pgfutil@tmpa}{TD("(\tikz@td@kP)-(\tikz@td@kC)o(nscreenx,nscreeny,nscreenz)")}%
+ \ifdim\pgfutil@tmpa pt<0pt\def\pgfutil@tmpb{back}\else\def\pgfutil@tmpb{front}\fi
+ \path (\tikz@td@kP) node[/tikz/3d/point on sphere/\pgfutil@tmpb]
+  {\pgfutil@tmpo{\pgfutil@tmpb\space text}};
+}},3d/point on sphere/.cd,C/.initial={(0,0,0)},P/.initial={(0,0,1)},%
+	front/.style={},back/.style={},%
+	front text/.initial=\textbullet,back text/.initial=\(\circ\)}
+% cones and frusta
+% \tikz@td@cone@frame{<axis>}{<s>} computes, for the axis direction <axis>
+% and a signed length <s> along it (pointing from the base center to the
+% apex), the unit axis \tikz@td@ca, \tikz@td@cnz = axis o n_screen,
+% \tikz@td@cs = |axis x n_screen| and an orthonormal frame \tikz@td@ce,
+% \tikz@td@cf of the base plane. \tikz@td@cf lies in the screen plane, and
+% \tikz@td@ce is oriented such that the projection of the apex lies on the
+% positive x axis of the frame, so the arc through angle 0 is always the one
+% on the apex side.
+\def\tikz@td@cone@frame#1#2{%
+  \pgfmathsetmacro{\tikz@td@ca}{TDunit("#1")}%
+  \pgfmathsetmacro{\tikz@td@cnz}{TD("(\tikz@td@ca)o(nscreenx,nscreeny,nscreenz)")}%
+  \pgfmathsetmacro{\tikz@td@cf}{TD("(\tikz@td@ca)x(nscreenx,nscreeny,nscreenz)")}%
+  \pgfmathsetmacro{\tikz@td@cs}{sqrt(abs(TD("(\tikz@td@cf)o(\tikz@td@cf)")))}%
+  \ifnum\fpeval{\tikz@td@cs<0.001}=1\relax
+   % looking along the axis: any vector orthogonal to the axis will do
+   \pgfmathsetmacro{\tikz@td@cs}{0}%
+   \pgfmathsetmacro{\tikz@td@cf}{normalcandidate(\tikz@td@ca)}%
+   \pgfmathsetmacro{\tikz@td@cf}{TD("(\tikz@td@ca)x(\tikz@td@cf)")}%
+  \fi
+  \pgfmathsetmacro{\tikz@td@cf}{TDunit("(\tikz@td@cf)")}%
+  \pgfmathsetmacro{\tikz@td@ce}{TD("(\tikz@td@cf)x(\tikz@td@ca)")}%
+  \pgfmathtruncatemacro{\tikz@td@ci}{(#2)*\tikz@td@cnz*TD("(\tikz@td@ce)o(nscreenx,nscreeny,nscreenz)")>0?1:0}%
+  \ifnum\tikz@td@ci=1\relax
+   \pgfmathsetmacro{\tikz@td@ce}{TD("-1*(\tikz@td@ce)")}%
+  \fi
+  % screen images of the frame vectors (for the x and y keys)
+  \tikz@scan@one@point\pgfutil@firstofone(\tikz@td@ce)\relax
+  \edef\tikz@td@cx{\the\pgf@x,\the\pgf@y}%
+  \tikz@scan@one@point\pgfutil@firstofone(\tikz@td@cf)\relax
+  \edef\tikz@td@cy{\the\pgf@x,\the\pgf@y}}%
+% after \tikz@td@cone@frame: \tikz@td@kw is the unit vector in the base plane
+% that points to the viewer
+\def\tikz@td@cone@viewer{%
+  \pgfmathsetmacro{\tikz@td@kq}{TD("(\tikz@td@ce)o(nscreenx,nscreeny,nscreenz)")}%
+  \ifdim\tikz@td@kq pt<0pt\pgfmathsetmacro{\tikz@td@kw}{TD("-1*(\tikz@td@ce)")}%
+  \else\let\tikz@td@kw\tikz@td@ce\fi}%
+% \tikz@td@kdepth\macro{<a>}{<b>}: \macro is the depth of the point
+% <a>*\tikz@td@ca + <b>*\tikz@td@kw (unit axis and \tikz@td@kw)
+\def\tikz@td@kdepth#1#2#3{%
+  \edef\tikz@td@kpt{(\csname __tdtools_vcomb:nnnn\endcsname{#2}{\tikz@td@ca}{#3}{\tikz@td@kw})}%
+  \expandafter\tikz@td@depthof\expandafter{\tikz@td@kpt}%
+  \let#1\tikz@td@depthval}%
+\def\tikz@td@cone@code#1{% #1=1: shaded
+  \def\tikz@td@cshaded{#1}%
+  \pgfmathsetmacro{\tikz@td@r}{\pgfkeysvalueof{/tikz/3d/r}}%
+  \pgfmathsetmacro{\tikz@td@h}{\pgfkeysvalueof{/tikz/3d/h}}%
+  \tikz@td@cone@frame{\pgfkeysvalueof{/tikz/3d/cone/axis}}{\tikz@td@h}%
+  \pgfmathsetmacro{\tikz@td@cp}{TD("\tikz@td@h*(\tikz@td@ca)")}%
+  \path[overlay] (0,0,0) coordinate (-base) (\tikz@td@cp) coordinate (-apex)
+   coordinate (-tip);% -tip: old name of the apex
+  % screen angle of the direction from the base center to the apex
+  \tikz@scan@one@point\pgfutil@firstofone(\tikz@td@cp)\relax
+  \edef\pgfutil@tmpa{\the\pgf@x}\edef\pgfutil@tmpb{\the\pgf@y}%
+  \pgfmathsetmacro{\tikz@td@cp}{atan2(\pgfutil@tmpb,\pgfutil@tmpa)}%
+  \pgfkeyslet{/tikz/3d/cone/screen angle}{\tikz@td@cp}%
+  \ifnum#1=1\relax % light model for 3d/cone/outer shade and inner shade
+   \tikz@td@cone@light{\tikz@td@ce}{\tikz@td@cf}{\tikz@td@ca}{0,0,0}%
+  \fi
+  % base face oriented towards the viewer?
+  \pgfmathtruncatemacro{\tikz@td@ci}{\tikz@td@h*\tikz@td@cnz<0?1:0}%
+  % projection of the apex outside the projection of the base?
+  \pgfmathtruncatemacro{\tikz@td@cj}{abs(\tikz@td@h)*\tikz@td@cs>abs(\tikz@td@r*\tikz@td@cnz)?1:0}%
+  % depths of the pieces: base center, centroid of the front half of the
+  % mantle, middle of the rim behind; the radius breaks ties
+  \pgfmathsetmacro\tikz@td@kext{abs(\tikz@td@r)}%
+  \tikz@td@cone@viewer
+  \tikz@td@kdepth\tikz@td@kdi{0}{0}%
+  \tikz@td@kdepth\tikz@td@kdo{\tikz@td@h/3}{4*abs(\tikz@td@r)/(3*pi)}%
+  \tikz@td@kdepth\tikz@td@kdh{0}{-2*abs(\tikz@td@r)/pi}%
+  \begin{scope}[x/.expanded={(\tikz@td@cx)},y/.expanded={(\tikz@td@cy)}]
+   \ifnum\tikz@td@cj=1\relax
+    \pgfmathsetmacro{\tikz@td@ac}{acos(abs(\tikz@td@r*\tikz@td@cnz)/(abs(\tikz@td@h)*\tikz@td@cs))}%
+    \ifnum\tikz@td@ci=1\relax
+     % base (or interior) and the part of the mantle outside the base
+     \tikz@td@piece{\tikz@td@kdi}{\path[/tikz/3d/cone/td@region=inner] (0,0) circle[radius=\tikz@td@r];}%
+     \tikz@td@piece{\tikz@td@kdo}{\path[/tikz/3d/cone/td@region=outer] (\tikz@td@ac:\tikz@td@r)
+      arc[start angle=\tikz@td@ac,end angle=-\tikz@td@ac,radius=\tikz@td@r]
+      -- (-apex) -- cycle;}%
+    \else
+     % mantle, the base rim on the apex side is hidden
+     \tikz@td@piece{\tikz@td@kdo}{\path[/tikz/3d/cone/td@region=outer] (\tikz@td@ac:\tikz@td@r)
+      arc[start angle=\tikz@td@ac,end angle=360-\tikz@td@ac,radius=\tikz@td@r]
+      -- (-apex) -- cycle;}%
+     \tikz@td@piece{\tikz@td@kdh}{\path[/tikz/3d/hidden,/tikz/3d/edge only] (\tikz@td@ac:\tikz@td@r)
+      arc[start angle=\tikz@td@ac,end angle=-\tikz@td@ac,radius=\tikz@td@r];}%
+    \fi
+   \else
+    \ifnum\tikz@td@ci=1\relax
+     \tikz@td@piece{\tikz@td@kdi}{\path[/tikz/3d/cone/td@region=inner] (0,0) circle[radius=\tikz@td@r];}%
+    \else
+     \tikz@td@piece{\tikz@td@kdo}{\path[/tikz/3d/cone/td@region=outer] (0,0) circle[radius=\tikz@td@r];}%
+    \fi
+   \fi
+  \end{scope}}%
 \tikzset{pics/3d/cone/.style={code={%
 	\tikzset{3d/.cd,#1}%
-	\def\pv##1{\pgfkeysvalueof{/tikz/3d/##1}}%
-	\pgfmathsetmacro{\sdtip}{screendepth(0,0,\pv{h})}
-	\pgfmathsetmacro{\aspectangle}{atan2(\sdtip,sqrt(\pv{h}*\pv{h}-\sdtip*\sdtip))}
-	\path (0,0,\pv{h}) coordinate (-tip);
-	\pgfmathsetmacro{\myey}{TDunit("(0,0,1)x(nscreenx,nscreeny,nscreenz)")}%
-	\path (0,0,{tan(\aspectangle)}) coordinate (-tmpex)
-		(\myey) coordinate (-tmpey);	
-    \begin{scope}[x={(-tmpex)},y={(-tmpey)}]
-	 \pgfmathtruncatemacro{\itest}{abs(tan(\aspectangle)*\pv{r}/\pv{h})<1}
-	 \ifnum\itest=1
-	  \pgfmathsetmacro{\alphacrit}{acos(tan(\aspectangle)*\pv{r}/\pv{h})}
-	  \ifdim\sdtip pt>0pt
-	   \path[/tikz/3d/hidden] (\alphacrit:\pv{r}) arc[start angle=\alphacrit,end
-	   angle=-\alphacrit,radius=\pv{r}];
-	   \path[/tikz/3d/visible,/tikz/3d/cone/outer] (\alphacrit:\pv{r}) 
-	   arc[start angle=\alphacrit,end  angle=360-\alphacrit,radius=\pv{r}]
-	   -- (-tip) -- cycle;
-	  \else
-	   \path[/tikz/3d/visible,/tikz/3d/cone/inner] (0,0) circle[radius=\pv{r}];
-	   \path[/tikz/3d/visible,/tikz/3d/cone/outer] (\alphacrit:\pv{r}) 
-	   arc[start angle=\alphacrit,end  angle=-\alphacrit,radius=\pv{r}]
-	   -- (-tip) -- cycle;
-	  \fi
-	 \else
-	  \path[/tikz/3d/visible] circle[radius=\pv{r}];	 
-	 \fi
-    \end{scope}
-	}},3d/cone/.cd,outer/.style={},inner/.style={}}
-%%
-\tikzset{pics/3d/shaded cone/.style={code={%
+	\tikz@td@cone@code{0}%
+	}},
+	pics/3d/shaded cone/.style={code={%
 	\tikzset{3d/.cd,#1}%
-	\def\pv##1{\pgfkeysvalueof{/tikz/3d/##1}}%
-	\pgfmathsetmacro{\sdtip}{screendepth(0,0,\pv{h})}
-	\pgfmathsetmacro{\aspectangle}{atan2(\sdtip,sqrt(\pv{h}*\pv{h}-\sdtip*\sdtip))}
-	\path (0,0,0) coordinate (-base) (0,0,\pv{h}) coordinate (-tip);
-    \begin{scope}[x={(0,0,tan(\aspectangle))},y={($(0,0,0)!1cm!90:(0,0,\pv{h})$)}]
-	 \pgfmathtruncatemacro{\itest}{abs(tan(\aspectangle)*\pv{r}/\pv{h})<1}
-	 % zero means tip inside projection of the base
-	 \ifnum\itest=1
-	  \pgfmathsetmacro{\alphacrit}{acos(tan(\aspectangle)*\pv{r}/\pv{h})}
-   	  \pgfmathtruncatemacro{\itest}{y2d("-tip")>y2d("-base")?1:0}
-      \ifnum\itest=1 
-	   \pgfmathsetmacro{\alphacritB}{-\alphacrit}
-	   \pgfmathsetmacro{\alphacritC}{360-\alphacrit}
-	  \else
-	   \pgfmathsetmacro{\alphacritB}{360-\alphacrit}
-	   \pgfmathsetmacro{\alphacritC}{-\alphacrit}
-	  \fi
-	  %\typeout{\sdtip,\itest,\alphacrit,\alphacritB,\alphacritC}
-	  \ifdim\sdtip pt>0pt
-	   \begin{scope}
-	    \clip (\alphacrit:\pv{r}) 
-	     arc[start angle=\alphacrit,end  angle=\alphacritC,radius=\pv{r}]
-	     -- (-tip) -- cycle;
-	    \path[3d/cone/outer shade,3d/screen coords]	
-		 (-tip) circle[radius={abs(\pv{r})+abs(\pv{h})}];
-	   \end{scope}
-	   \path[/tikz/3d/hidden] (\alphacrit:\pv{r}) arc[start angle=\alphacrit,end
-	    angle=\alphacritB,radius=\pv{r}];
-	   \path[/tikz/3d/visible] (\alphacrit:\pv{r}) 
-	    arc[start angle=\alphacrit,end  angle=\alphacritC,radius=\pv{r}]
-	    -- (-tip) -- cycle;
-	  \else
-	   \begin{scope}
-	    \clip (0,0) circle[radius=\pv{r}];
-	    \path[3d/cone/inner shade,3d/screen coords]	
-		 (-tip) circle[radius={abs(\pv{r})+abs(\pv{h})}];
-	   \end{scope}
-	   \path[/tikz/3d/visible,/tikz/3d/cone/inner] (0,0) circle[radius=\pv{r}];
-	   \begin{scope}
-	    \clip (\alphacrit:\pv{r}) 
-	     arc[start angle=\alphacrit,end  angle=\alphacritB,radius=\pv{r}]
-	    -- (-tip) -- cycle;
-	    \path[3d/cone/outer shade,3d/screen coords]	
-		 (-tip) circle[radius={abs(\pv{r})+abs(\pv{h})}];
-	   \end{scope}
-	   \path[/tikz/3d/visible,/tikz/3d/cone/outer] (\alphacrit:\pv{r}) 
-	    arc[start angle=\alphacrit,end  angle=\alphacritB,radius=\pv{r}]
-	    -- (-tip) -- cycle;
-	  \fi
-	 \else
-      \ifdim\sdtip pt>0pt
-	   \begin{scope}
-		\clip (0,0) circle[radius=\pv{r}];	 
-	     \path[3d/cone/outer shade,3d/screen coords]	
-		  (-tip) circle[radius={abs(\pv{r})+abs(\pv{h})}];
-	   \end{scope}
-	  \else
-	   \begin{scope}
-		\clip (0,0) circle[radius=\pv{r}];	 
-	     \path[3d/cone/inner shade,3d/screen coords]	
-		  (-tip) circle[radius={abs(\pv{r})+abs(\pv{h})}];
-	   \end{scope}
-	  \fi
-	  \path[/tikz/3d/visible] circle[radius=\pv{r}];	 
-	 \fi
-    \end{scope}
-	}},3d/cone/.cd,outer shade/.style={3d/cone shading},
-	inner shade/.style={3d/cone shading={brightness=0.3}}}	
+	\tikz@td@cone@code{1}%
+	}},
+	3d/frustum/outer/.style={},3d/frustum/inner/.style={},
+	3d/cone/.cd,outer/.style={},inner/.style={},
+	% visible region of a cone (outer: mantle, inner: base/interior)
+	td@region/.code={\tikzset{/tikz/3d/visible,/tikz/3d/cone/#1}%
+	 \ifnum\tikz@td@cshaded=1\relax
+	  \tikzset{path picture={\path[/tikz/3d/cone/#1 shade,/tikz/3d/screen coords]
+	   (-apex) circle[radius={abs(\tikz@td@r)+abs(\tikz@td@h)}];}}%
+	 \fi},
+	outer shade/.style={3d/cone/lit side=outer},
+	inner shade/.style={3d/cone/lit side=inner},
+	axis/.initial={(0,0,1)},
+	apex/.code={% apex relative to the base center; sets axis and h
+	 \pgfmathsetmacro{\pgfutil@tmpa}{TD("#1")}%
+	 \pgfmathsetmacro{\pgfutil@tmpb}{sqrt(abs(TD("(\pgfutil@tmpa)o(\pgfutil@tmpa)")))}%
+	 \pgfkeyslet{/tikz/3d/h}{\pgfutil@tmpb}%
+	 \pgfkeys{/tikz/3d/cone/axis/.expanded={(\pgfutil@tmpa)}}},
+	screen angle/.initial=90}
 %%
+% \tikz@td@kdepthe\macro{<a>}{<b>}: \macro is the depth of the point
+% <a>*\tikz@td@ca + <b>*\tikz@td@ce
+\def\tikz@td@kdepthe#1#2#3{%
+  \edef\tikz@td@kpt{(\csname __tdtools_vcomb:nnnn\endcsname{#2}{\tikz@td@ca}{#3}{\tikz@td@ce})}%
+  \expandafter\tikz@td@depthof\expandafter{\tikz@td@kpt}%
+  \let#1\tikz@td@depthval}%
+% \tikz@td@frustum@arc{<rim B or S>}{<height>}{<radius>}{<from>}{<to>}{<mean
+% cosine>}{<visible or hidden>}: an arc of a rim of the frustum as a piece
+\def\tikz@td@frustum@arc#1#2#3#4#5#6#7{%
+  \tikz@td@kdepthe\tikz@td@kd{#2}{(#3)*(#6)}%
+  \edef\tikz@td@kpC{\noexpand\path[/tikz/3d/#7,/tikz/3d/edge only]}%
+  \expandafter\tikz@td@piece\expandafter{\tikz@td@kd}{\tikz@td@kpC
+    ($(-tdtmp#1)+(#4:#3)$) arc[start angle=#4,end angle=#5,radius=#3];}}%
 \tikzset{pics/3d/frustum/.style={code={%
-  \tikzset{3d/.cd,#1}
-  \def\pv##1{\pgfkeysvalueof{/tikz/3d/##1}}%
-  \pgfmathtruncatemacro{\itest}{abs(\pv{R}-\pv{r})>0.02}
-  \ifnum\itest=0
-   %\PackageWarning{3dtools}{Radii R=\pv{R} and r=\pv{r} are too close.}%
-   \path[overlay] (0,0,0) coordinate (-tdtmpo)
-	(0,0,\pv{h}) coordinate (-tdtmpez)
-	($(0,0,0)!1cm!90:(0,0,\pv{h})$) coordinate (-tdtmpey);
-   \pgfmathsetmacro{\mytest}{y2d("-tdtmpez")}	
-   \pgfmathsetmacro@td@FPU{\pgfutil@tmpa}{sqrt(pow(x2d("-tdtmpo")-x2d("-tdtmpez"),2)+pow(y2d("-tdtmpo")-y2d("-tdtmpez"),2))}%
-   \pgfmathtruncatemacro{\itest}{(\pgfutil@tmpa>0.5?1:0)}%
-   \ifnum\itest=0
-	\draw[3d/visible] (0,0,0) circle[radius=R];
-   \else
-    \pgfmathtruncatemacro{\itest}{sign(screendepth(0,0,\pv{h}))+1}%
-	\pgfmathsetmacro{\sdtip}{screendepth(0,0,\pv{h})}%
-	\pgfmathsetmacro{\aspectangle}{atan2(\sdtip,\pgfutil@tmpa/1cm)}%
-	\path[overlay] (0,0,{tan(\aspectangle)}) coordinate (-tdtmpex);
-	\begin{scope}[x={(-tdtmpex)},y={(-tdtmpey)}]
-	 \ifcase\itest\relax
-      % "lower" circle visible
-	  \draw[3d/hidden] (-tdtmpez)+(0,\pv{r})
-	  	arc[start angle=90,end angle=-90,radius=\pv{r}];
-	  \draw[3d/visible]  (0,\pv{R}) 
-	   -- ($(-tdtmpez)+(0,\pv{r})$) 
-	   arc[start angle=90,end angle=270,radius=\pv{r}]
-	   -- (0,-\pv{R})
-	   (0,0) circle[radius=\pv{R}];
-	 \or
-      % no circle visible
-	  \draw[3d/visible]  (0,\pv{R}) 
-	   -- ($(-tdtmpez)+(0,\pv{r})$) 
-	   -- ($(-tdtmpez)+(0,-\pv{r})$) -- (0,-\pv{R}) -- cycle;
-	 \or
-      % "upper" circle visible
-	  \draw[3d/hidden] (0,\pv{R})
-	  	arc[start angle=90,end angle=-90,radius=\pv{R}];
-	  \draw[3d/visible] (-tdtmpez)+ (0,\pv{r}) 
-	   -- (0,\pv{R})
-	   arc[start angle=90,end angle=270,radius=\pv{R}]
-	   -- ($(-tdtmpez)+(0,-\pv{r})$) 
-	   (-tdtmpez) circle[radius=\pv{r}];
-	 \fi
-	\end{scope} 
-   \fi
-  \else
-   \pgfmathsetmacro{\myH}{(\pv{R}*\pv{h}/(\pv{R}-\pv{r}))}%
-   \pgfmathsetmacro{\sdtip}{screendepth(0,0,\myH)}%
-   \pgfmathsetmacro{\aspectangle}{atan2(\sdtip,sqrt(\myH*\myH-\sdtip*\sdtip))}%
-   %\typeout{H=\myH,angle=\aspectangle}
-   \path[overlay] (0,0,\myH) coordinate (-tip)
-   (0,0,\pv{h}) coordinate (-upper base)
-   (0,0,{tan(\aspectangle)}) coordinate (-tdtmpex)
-   ($(0,0,0)!1cm!90:(0,0,\pv{h})$) coordinate (-tdtmpey);
-   \begin{scope}[x={(-tdtmpex)},y={(-tdtmpey)}]
-	   \pgfmathtruncatemacro{\itest}{abs(tan(\aspectangle)*\pv{R}/\myH)<1}
-	   \path[local bounding box=pft] (-upper base) circle[radius=\pv{r}]
-	    (0,0,0) circle[radius=\pv{R}];
-	   \ifnum\itest=1
-		\pgfmathsetmacro{\alphacrit}{acos(tan(\aspectangle)*\pv{R}/\myH)}
-		\ifdim\sdtip pt>0pt\relax
-		 \begin{scope}
-		  \clip (-upper base) circle[radius=\pv{r}] ;
-		  \path[/tikz/3d/hidden] (\alphacrit:\pv{R}) arc[start angle=\alphacrit,end
-		  angle=-\alphacrit,radius=\pv{R}];
-		  \path[/tikz/3d/hidden] ($(-upper base)+(\alphacrit:\pv{r})$)
-		  --(\alphacrit:\pv{R}) 
-		  arc[start angle=\alphacrit,end  angle=360-\alphacrit,radius=\pv{R}]
-		  -- ($(-upper base)+(360-\alphacrit:\pv{r})$);
-		 \end{scope}
-		 \begin{scope}
-		  \clip[even odd clip] (-upper base) circle[radius=\pv{r}]  [generous outside path];
-		  \path[/tikz/3d/hidden] (\alphacrit:\pv{R}) arc[start angle=\alphacrit,end
-		  angle=-\alphacrit,radius=\pv{R}];
-		  \path[/tikz/3d/visible] ($(-upper base)+(\alphacrit:\pv{r})$)
-		  --(\alphacrit:\pv{R}) 
-		  arc[start angle=\alphacrit,end  angle=360-\alphacrit,radius=\pv{R}]
-		  -- ($(-upper base)+(360-\alphacrit:\pv{r})$);
-		 \end{scope}
-		 \path[/tikz/3d/visible] (-upper base) circle[radius=\pv{r}];
-		\else %\typeout{\sdtip<0}
-		 \begin{scope}
-		  \clip circle[radius=\pv{R}];
-		  \path[/tikz/3d/hidden] ($(-upper base)+(\alphacrit:\pv{r})$)
-		  --(\alphacrit:\pv{R}) 
-		  ($(-upper base)+(360-\alphacrit:\pv{r})$)
-		  --(360-\alphacrit:\pv{R});
-		  \path[/tikz/3d/hidden] (-upper base) circle[radius=\pv{r}];
-		 \end{scope}
-% 		 % enlarge the bounding box
-% 		 \path ($(-upper base)+(\alphacrit:\pv{r})$)
-% 		 --(\alphacrit:\pv{R}) 
-% 		 ($(-upper base)+(360-\alphacrit:\pv{r})$)
-% 		 --(360-\alphacrit:\pv{R});
-% 		 \path (-upper base) circle[radius=\pv{r}];
-		 \begin{scope}
- 		  \clip[even odd clip] circle[radius=\pv{R}] [generous outside path];
-		  \path[/tikz/3d/hidden]  ($(-upper base)+(\alphacrit:\pv{r})$)
-		  arc[start angle=\alphacrit,end  angle=-\alphacrit,radius=\pv{r}];
-		  \path[/tikz/3d/visible] (\alphacrit:\pv{R}) --
-		  ($(-upper base)+(\alphacrit:\pv{r})$)
-		  arc[start angle=\alphacrit,end  angle=360-\alphacrit,radius=\pv{r}]
-		  --(360-\alphacrit:\pv{R});
-		 \end{scope}
-		 \path[/tikz/3d/visible] circle[radius=\pv{R}];
-		\fi
-	   \else
-		\path[/tikz/3d/visible] circle[radius=\pv{R}];	 
-		\path[/tikz/3d/hidden] (-upper base) circle[radius=\pv{r}];
-	   \fi
-   \end{scope}
+  \tikzset{3d/.cd,#1}%
+  \pgfmathsetmacro{\tikz@td@R}{\pgfkeysvalueof{/tikz/3d/R}}%
+  \pgfmathsetmacro{\tikz@td@r}{\pgfkeysvalueof{/tikz/3d/r}}%
+  \pgfmathsetmacro{\tikz@td@h}{\pgfkeysvalueof{/tikz/3d/h}}%
+  \pgfmathsetmacro{\tikz@td@cp}{TDunit("\pgfkeysvalueof{/tikz/3d/cone/axis}")}%
+  \pgfmathsetmacro{\tikz@td@cp}{TD("\tikz@td@h*(\tikz@td@cp)")}%
+  \path[overlay] (0,0,0) coordinate (-base) (\tikz@td@cp) coordinate (-upper base);
+  % the (virtual) apex; omitted for near-cylinders, where it lies so far
+  % away that placing it would exceed TeX's dimension range
+  \ifnum\fpeval{abs(\tikz@td@R-\tikz@td@r)>0.001
+    && abs(\tikz@td@R*\tikz@td@h/(\tikz@td@R-\tikz@td@r))<=100}=1\relax
+   \pgfmathsetmacro{\tikz@td@cp}{TD("\tikz@td@R/(\tikz@td@R-\tikz@td@r)*(\tikz@td@cp)")}%
+   \path[overlay] (\tikz@td@cp) coordinate (-tip);
   \fi
+  % big rim B (radius \tikz@td@Rb) and small rim S (radius \tikz@td@Rs);
+  % \tikz@td@d is the signed distance from B to S along the axis
+  \pgfmathtruncatemacro{\tikz@td@ci}{\tikz@td@R<\tikz@td@r?1:0}%
+  \ifnum\tikz@td@ci=1\relax
+   \let\tikz@td@Rb\tikz@td@r \let\tikz@td@Rs\tikz@td@R
+   \pgfmathsetmacro{\tikz@td@d}{-1*\tikz@td@h}%
+   \path[overlay] (-upper base) coordinate (-tdtmpB) (-base) coordinate (-tdtmpS);
+  \else
+   \let\tikz@td@Rb\tikz@td@R \let\tikz@td@Rs\tikz@td@r
+   \let\tikz@td@d\tikz@td@h
+   \path[overlay] (-base) coordinate (-tdtmpB) (-upper base) coordinate (-tdtmpS);
+  \fi
+  \tikz@td@cone@frame{\pgfkeysvalueof{/tikz/3d/cone/axis}}{\tikz@td@d}%
+  % big face oriented towards the viewer? (otherwise the small one is)
+  \pgfmathtruncatemacro{\tikz@td@ci}{\tikz@td@d*\tikz@td@cnz<0?1:0}%
+  % tangents exist?
+  \pgfmathtruncatemacro{\tikz@td@cj}{abs(\tikz@td@d)*\tikz@td@cs>abs((\tikz@td@Rb-\tikz@td@Rs)*\tikz@td@cnz)?1:0}%
+  % pieces, with the depths of their centroids: the two patches of the mantle
+  % between the generatrices of the silhouette (A around the angle 0, i.e. on
+  % the apex side, and B), one shows its outer side, the other its inner side
+  % (styles 3d/frustum/outer and inner); the four arcs of the rims and the two
+  % generatrices (3d/visible or 3d/hidden). The ends are open.
+  \pgfmathsetmacro\tikz@td@kext{max(abs(\tikz@td@R),abs(\tikz@td@r))}%
+  \ifdim\tikz@td@R pt<\tikz@td@r pt\def\tikz@td@kzB{\tikz@td@h}\def\tikz@td@kzS{0}%
+  \else\def\tikz@td@kzB{0}\def\tikz@td@kzS{\tikz@td@h}\fi
+  \pgfmathsetmacro\tikz@td@krm{(abs(\tikz@td@Rb)+abs(\tikz@td@Rs))/2}%
+  % does patch A show its outer side? (outward normal at the angle 0)
+  \pgfmathsetmacro{\tikz@td@kq}{TD("(\tikz@td@ce)o(nscreenx,nscreeny,nscreenz)")}%
+  \pgfmathsetmacro{\tikz@td@kq}{abs(\tikz@td@d)*\tikz@td@kq+(\tikz@td@d<0?-1:1)*(\tikz@td@Rb-\tikz@td@Rs)*\tikz@td@cnz}%
+  \ifdim\tikz@td@kq pt>0pt\def\tikz@td@kA{outer}\def\tikz@td@kB{inner}%
+  \else\def\tikz@td@kA{inner}\def\tikz@td@kB{outer}\fi
+  \begin{scope}[x/.expanded={(\tikz@td@cx)},y/.expanded={(\tikz@td@cy)}]
+   \ifnum\tikz@td@cj=1\relax
+    \pgfmathsetmacro{\tikz@td@ac}{acos(abs((\tikz@td@Rb-\tikz@td@Rs)*\tikz@td@cnz)/(abs(\tikz@td@d)*\tikz@td@cs))}%
+    % mean cosine of the angle over [-ac,ac] and over [ac,360-ac]
+    \pgfmathsetmacro\tikz@td@kmA{sin(\tikz@td@ac)/(max(\tikz@td@ac,0.01)*pi/180)}%
+    \pgfmathsetmacro\tikz@td@kmB{-sin(\tikz@td@ac)/(max(180-\tikz@td@ac,0.01)*pi/180)}%
+    \tikz@td@kdepthe\tikz@td@kdA{\tikz@td@h/2}{\tikz@td@krm*\tikz@td@kmA}%
+    \tikz@td@kdepthe\tikz@td@kdB{\tikz@td@h/2}{\tikz@td@krm*\tikz@td@kmB}%
+    \edef\tikz@td@kpA{\noexpand\path[/tikz/3d/frustum/\tikz@td@kA]}%
+    \edef\tikz@td@kpB{\noexpand\path[/tikz/3d/frustum/\tikz@td@kB]}%
+    \expandafter\tikz@td@piece\expandafter{\tikz@td@kdA}{\tikz@td@kpA
+      ($(-tdtmpB)+(-\tikz@td@ac:\tikz@td@Rb)$)
+      arc[start angle=-\tikz@td@ac,end angle=\tikz@td@ac,radius=\tikz@td@Rb]
+      -- ($(-tdtmpS)+(\tikz@td@ac:\tikz@td@Rs)$)
+      arc[start angle=\tikz@td@ac,end angle=-\tikz@td@ac,radius=\tikz@td@Rs] -- cycle;}%
+    \expandafter\tikz@td@piece\expandafter{\tikz@td@kdB}{\tikz@td@kpB
+      ($(-tdtmpB)+(\tikz@td@ac:\tikz@td@Rb)$)
+      arc[start angle=\tikz@td@ac,end angle=360-\tikz@td@ac,radius=\tikz@td@Rb]
+      -- ($(-tdtmpS)+(360-\tikz@td@ac:\tikz@td@Rs)$)
+      arc[start angle=360-\tikz@td@ac,end angle=\tikz@td@ac,radius=\tikz@td@Rs] -- cycle;}%
+    % rims: hidden is the part of S on the side B (if the big face is towards
+    % the viewer), else the part of B on the side A
+    \tikz@td@frustum@arc{B}{\tikz@td@kzB}{\tikz@td@Rb}{-\tikz@td@ac}{\tikz@td@ac}{\tikz@td@kmA}%
+      {\ifnum\tikz@td@ci=1 visible\else hidden\fi}%
+    \tikz@td@frustum@arc{B}{\tikz@td@kzB}{\tikz@td@Rb}{\tikz@td@ac}{360-\tikz@td@ac}{\tikz@td@kmB}{visible}%
+    \tikz@td@frustum@arc{S}{\tikz@td@kzS}{\tikz@td@Rs}{-\tikz@td@ac}{\tikz@td@ac}{\tikz@td@kmA}{visible}%
+    \tikz@td@frustum@arc{S}{\tikz@td@kzS}{\tikz@td@Rs}{\tikz@td@ac}{360-\tikz@td@ac}{\tikz@td@kmB}%
+      {\ifnum\tikz@td@ci=1 hidden\else visible\fi}%
+    % generatrices of the silhouette
+    \tikz@td@kdepthe\tikz@td@kdg{\tikz@td@h/2}{\tikz@td@krm*cos(\tikz@td@ac)}%
+    \expandafter\tikz@td@piece\expandafter{\tikz@td@kdg}{\path[/tikz/3d/visible,/tikz/3d/edge only]
+      ($(-tdtmpB)+(\tikz@td@ac:\tikz@td@Rb)$) -- ($(-tdtmpS)+(\tikz@td@ac:\tikz@td@Rs)$)
+      ($(-tdtmpB)+(-\tikz@td@ac:\tikz@td@Rb)$) -- ($(-tdtmpS)+(-\tikz@td@ac:\tikz@td@Rs)$);}%
+   \else
+    % seen (almost) along the axis: the whole mantle shows one side
+    \ifnum\tikz@td@ci=1\relax\def\tikz@td@kA{inner}\else\def\tikz@td@kA{outer}\fi
+    \tikz@td@kdepthe\tikz@td@kdA{\tikz@td@h/2}{0}%
+    \edef\tikz@td@kpA{\noexpand\path[even odd rule,/tikz/3d/frustum/\tikz@td@kA]}%
+    \expandafter\tikz@td@piece\expandafter{\tikz@td@kdA}{\tikz@td@kpA
+      (-tdtmpB) circle[radius=\tikz@td@Rb] (-tdtmpS) circle[radius=\tikz@td@Rs];}%
+    \tikz@td@kdepthe\tikz@td@kdB{\tikz@td@kzB}{0}%
+    \tikz@td@kdepthe\tikz@td@kdS{\tikz@td@kzS}{0}%
+    \edef\tikz@td@kpB{\noexpand\path[/tikz/3d/\ifnum\tikz@td@ci=1 hidden\else visible\fi,/tikz/3d/edge only]}%
+    \expandafter\tikz@td@piece\expandafter{\tikz@td@kdS}{\tikz@td@kpB (-tdtmpS) circle[radius=\tikz@td@Rs];}%
+    \expandafter\tikz@td@piece\expandafter{\tikz@td@kdB}{\path[/tikz/3d/visible,/tikz/3d/edge only]
+      (-tdtmpB) circle[radius=\tikz@td@Rb];}%
+   \fi
+  \end{scope}
 }}}
 %		
-\pgfmathdeclarefunction{tddistance}{2}{%
-\begingroup%
-\pgfmathparse@td@FPU{sqrt(TD("#1-#2o#1-#2"))}%
-\pgfmathsmuggle\pgfmathresult\endgroup%
-}%
 % intersection of three spheres (see https://stackoverflow.com/a/18654302)
 % 
 %     temp1 = P2-P1                                        
@@ -1681,6 +2594,9 @@ projection prefix/.initial=tmpp}
 %     return p_12_a,p_12_b                       
 \tikzset{3d/.cd,intersection of three spheres/.code={%
 \tikzset{3d/aux keys/.cd,#1,/tikz/3d/define orthonormal dreibein}%
+\ifnum\tikz@td@dreibein@ok=0
+\PackageWarning{3dtools}{The sphere centers are (almost) collinear. Cannot intersect the three spheres.}%
+\else
 \pgfmathsetmacro\pgfutil@tmpA{TD("\pgfkeysvalueof{/tikz/3d/aux keys/A}")}%
 \pgfmathsetmacro\pgfutil@tmpB{TD("\pgfkeysvalueof{/tikz/3d/aux keys/B}")}%
 \pgfmathsetmacro\pgfutil@tmpC{TD("\pgfkeysvalueof{/tikz/3d/aux keys/C}")}%
@@ -1689,7 +2605,7 @@ projection prefix/.initial=tmpp}
 \pgfmathsetmacro\pgfutil@tmpez{TD("\pgfkeysvalueof{/tikz/3d/aux keys/ez}")}%
 \pgfmathsetmacro\pgfutil@tmpAB{TD("(\pgfutil@tmpB)-(\pgfutil@tmpA)")}%
 \pgfmathsetmacro\pgfutil@tmpd{sqrt(TD("(\pgfutil@tmpAB)o(\pgfutil@tmpAB)"))}%
-\ifdim\pgfutil@tmpd pt<0.1pt\relax
+\ifnum\fpeval{\pgfutil@tmpd<0.1}=1\relax
 \PackageWarning{3dtools}{Points \pgfkeysvalueof{/tikz/3d/aux keys/A} and \pgfkeysvalueof{/tikz/3d/aux keys/B} are too close to each other.}%
 \else
 \pgfmathsetmacro\pgfutil@tmpAC{TD("(\pgfutil@tmpC)-(\pgfutil@tmpA)")}% temp2
@@ -1709,7 +2625,7 @@ projection prefix/.initial=tmpp}
 +(\pgfutil@tmpj)*(\pgfutil@tmpj))/(2*(\pgfutil@tmpj))}%
 %     temp4 = r1*r1 - x*x - y*y                            
 \pgfmathsetmacro\pgfutil@tmpc{\pgfutil@tmprA*\pgfutil@tmprA-pow(\pgfutil@tmpx,2)-pow(\pgfutil@tmpy,2)}%
-\ifdim\pgfutil@tmpc pt<0pt\relax
+\ifnum\fpeval{\pgfutil@tmpc<0}=1\relax
 \PackageWarning{3dtools}{Not all spheres intersect.}%
 \else
 \pgfmathsetmacro\pgfutil@tmpz{sqrt(\pgfutil@tmpc)}%
@@ -1723,15 +2639,16 @@ projection prefix/.initial=tmpp}
 }}
 \fi
 \fi
+\fi
 }}%
 %
 \tikzset{3d/insphere center/.code={%
  \tikzset{3d/insphere/.cd,#1}%
- \pgfmathsetmacro{\pgfutil@tmpA}{TD("\pgfkeysvalueof{/tikz/3d/insphere/B}x\pgfkeysvalueof{/tikz/3d/insphere/C}")}%
+ \pgfmathsetmacro{\pgfutil@tmpA}{TD("\pgfkeysvalueof{/tikz/3d/insphere/C}-\pgfkeysvalueof{/tikz/3d/insphere/B}x\pgfkeysvalueof{/tikz/3d/insphere/D}-\pgfkeysvalueof{/tikz/3d/insphere/B}")}%
  \pgfmathsetmacro{\pgfutil@tmpA}{sqrt(TD("(\pgfutil@tmpA)o(\pgfutil@tmpA)"))/2}%
- \pgfmathsetmacro{\pgfutil@tmpB}{TD("\pgfkeysvalueof{/tikz/3d/insphere/A}x\pgfkeysvalueof{/tikz/3d/insphere/C}")}%
+ \pgfmathsetmacro{\pgfutil@tmpB}{TD("\pgfkeysvalueof{/tikz/3d/insphere/C}-\pgfkeysvalueof{/tikz/3d/insphere/A}x\pgfkeysvalueof{/tikz/3d/insphere/D}-\pgfkeysvalueof{/tikz/3d/insphere/A}")}%
  \pgfmathsetmacro{\pgfutil@tmpB}{sqrt(TD("(\pgfutil@tmpB)o(\pgfutil@tmpB)"))/2}%
- \pgfmathsetmacro{\pgfutil@tmpC}{TD("\pgfkeysvalueof{/tikz/3d/insphere/A}x\pgfkeysvalueof{/tikz/3d/insphere/B}")}%
+ \pgfmathsetmacro{\pgfutil@tmpC}{TD("\pgfkeysvalueof{/tikz/3d/insphere/B}-\pgfkeysvalueof{/tikz/3d/insphere/A}x\pgfkeysvalueof{/tikz/3d/insphere/D}-\pgfkeysvalueof{/tikz/3d/insphere/A}")}%
  \pgfmathsetmacro{\pgfutil@tmpC}{sqrt(TD("(\pgfutil@tmpC)o(\pgfutil@tmpC)"))/2}%
  \pgfmathsetmacro{\pgfutil@tmpD}{TD("\pgfkeysvalueof{/tikz/3d/insphere/A}-\pgfkeysvalueof{/tikz/3d/insphere/B}x\pgfkeysvalueof{/tikz/3d/insphere/C}-\pgfkeysvalueof{/tikz/3d/insphere/B}")}%
  \pgfmathsetmacro{\pgfutil@tmpD}{sqrt(TD("(\pgfutil@tmpD)o(\pgfutil@tmpD)"))/2}%
@@ -1813,9 +2730,8 @@ draw face with corners/.code={\begingroup\c@pgf@counta0\relax
 \pgfmathsetmacro{\pgfutil@tmpf}{sqrt(TD("(\pgfutil@tmpb)o(\pgfutil@tmpb)"))}%
 \pgfmathsetmacro{\pgfutil@tmpg}{sqrt(TD("(\pgfutil@tmpL)o(\pgfutil@tmpL)"))}%
 \pgfmathsetmacro{\pgfutil@tmph}{TD("(\pgfutil@tmpL)o(\pgfutil@tmpb)")/\pgfutil@tmpf/\pgfutil@tmpg}%
-\pgfmathtruncatemacro{\pgfutil@tmpi}{70+30*\pgfutil@tmph}%
 \pgfmathtruncatemacro{\pgfutil@tmpi}{\pgfkeysvalueof{/tikz/3d/polyhedron/shading function}(\pgfutil@tmph)}%
-\ifdim\pgfutil@tmpe pt<0pt\relax
+\ifnum\fpeval{\pgfutil@tmpe<0}=1\relax
 \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/polyhedron/back layer}}
 \tikzset{3d/polyhedron/before hidden,3d/polyhedron/back}%
 \if@tikz@td@complete@dashes
@@ -1885,15 +2801,14 @@ draw open face with corners/.code={\begingroup\c@pgf@counta0\relax
 \pgfmathsetmacro{\pgfutil@tmpf}{sqrt(TD("(\pgfutil@tmpb)o(\pgfutil@tmpb)"))}%
 \pgfmathsetmacro{\pgfutil@tmpg}{sqrt(TD("(\pgfutil@tmpL)o(\pgfutil@tmpL)"))}%
 \pgfmathsetmacro{\pgfutil@tmph}{TD("(\pgfutil@tmpL)o(\pgfutil@tmpb)")/\pgfutil@tmpf/\pgfutil@tmpg}%
-\pgfmathtruncatemacro{\pgfutil@tmpi}{70+30*\pgfutil@tmph}%
 \pgfmathtruncatemacro{\pgfutil@tmpi}{\pgfkeysvalueof{/tikz/3d/polyhedron/shading function}(\pgfutil@tmph)}%
-\ifdim\pgfutil@tmpe pt<0pt\relax
+\ifnum\fpeval{\pgfutil@tmpe<0}=1\relax
 \begin{pgfonlayer}{\pgfkeysvalueof{/tikz/3d/polyhedron/back layer}}
 \tikzset{3d/polyhedron/before hidden,3d/polyhedron/back}%
 \if@tikz@td@complete@dashes
-\path[fill=tikz@td@face@color!\pgfutil@tmpi!black,3d/polyhedron/back,draw=none] 
+\path[fill=tikz@td@face@color!\pgfutil@tmpi!black,3d/polyhedron/back,draw=none]
 	\pgfutil@tmpl;
-\edef\pgfutil@tmplg{\pgfutil@tmple\space edge \pgfutil@tmplf}%
+\let\pgfutil@tmplg\pgfutil@tmple
 \draw[3d/polyhedron/back,every edge/.append style={/tikz/3d/polyhedron/face edges}]
 	\pgfutil@tmplg;
 \else
@@ -1907,11 +2822,11 @@ draw open face with corners/.code={\begingroup\c@pgf@counta0\relax
 \if@tikz@td@complete@dashes
 \path[fill=tikz@td@face@color!\pgfutil@tmpi!black,3d/polyhedron/fore,draw=none]
  \pgfutil@tmpl ;
-\edef\pgfutil@tmplg{\pgfutil@tmple\space edge \pgfutil@tmplf}%
+\let\pgfutil@tmplg\pgfutil@tmple
 \draw[3d/polyhedron/fore,every edge/.append style={/tikz/3d/polyhedron/face edges}]
 	\pgfutil@tmplg;
 \else
-\draw[fill=tikz@td@face@color!\pgfutil@tmpi!black,3d/polyhedron/fore] \pgfutil@tmpl -- cycle;
+\draw[fill=tikz@td@face@color!\pgfutil@tmpi!black,3d/polyhedron/fore] \pgfutil@tmpl ;
 \fi
 \tikzset{3d/polyhedron/after visible}%
 \end{pgfonlayer}
@@ -1921,11 +2836,11 @@ draw open face with corners/.code={\begingroup\c@pgf@counta0\relax
 },
 color/.code={\colorlet{tikz@td@face@color}{#1}},color=yellow,
 O/.initial={(0,0,0)},% point inside the polyhedron
-L/.initial={(1,1,1)},% "light source",
+L/.initial={\pgfkeysvalueof{/tikz/3d/light}},% light direction, defaults to 3d/light
 fore/.style={draw,solid},fore layer/.initial=main,
 back/.style={draw,dashed,fill opacity=0},back layer/.initial=main,
 shading function/.initial={tikztdpolyhedronshade},
-/tikz/declare function={tikztdpolyhedronshade(\x)=70+30*\x;},
+/tikz/declare function={tikztdpolyhedronshade(\x)=100*tikztdlight(\x);},
 before visible/.code={},after visible/.code={},
 before hidden/.code={},after hidden/.code={},
 create face from vertices/.code={\let\pgfutil@tmpa\relax%
@@ -2010,42 +2925,53 @@ create faces from vertex list/.style={/tikz/3d/polyhedron/create face from verti
 %\def\pv##1{\pgfkeysvalueof{/tikz/3d/##1}}
 \pgfmathsetmacro{\tikz@td@vmin}{-atan2(sin(\pgfkeysvalueof{/tikz/3d/phi})*sin(\pgfkeysvalueof{/tikz/3d/theta}),cos(\pgfkeysvalueof{/tikz/3d/theta}))}%
 \pgfmathsetmacro{\tikz@td@vmax}{\tikz@td@vmin+180}%
-\path[3d/cylinder/mantle]
-  let \p1=($(0,1,0)-(0,0,0)$),\n1={atan2(\y1,\x1)+180} in
-  [shading angle=\n1]
-  plot[variable=\tikz@td@t,domain=\tikz@td@vmin:\tikz@td@vmax,smooth]
+\def\tikz@td@mantle{plot[variable=\tikz@td@t,domain=\tikz@td@vmin:\tikz@td@vmax,smooth]
     ({\pgfkeysvalueof{/tikz/3d/r}*cos(\tikz@td@t)},0,{\pgfkeysvalueof{/tikz/3d/r}*sin(\tikz@td@t)})
     -- 
     plot[variable=\tikz@td@t,domain=\tikz@td@vmax:\tikz@td@vmin,smooth]
     ({\pgfkeysvalueof{/tikz/3d/r}*cos(\tikz@td@t)},\pgfkeysvalueof{/tikz/3d/h},{\pgfkeysvalueof{/tikz/3d/r}*sin(\tikz@td@t)})
-    --cycle;
+    --cycle}%
+\pgfmathsetmacro{\tikz@td@ex}{TDunit("(0,1,0)x(nscreenx,nscreeny,nscreenz)")}%
+\tikz@td@cylinder@light{\tikz@td@ex}{0,1,0}%
+\path[3d/cylinder/lighting] \tikz@td@mantle;
+\path[3d/cylinder/mantle]
+  let \p1=($(0,1,0)-(0,0,0)$),\n1={atan2(\y1,\x1)+180} in
+  [3d/cylinder/shading angle=\n1]
+  \tikz@td@mantle;
+\tikz@td@cylinder@cap{0,1,0}%
 \pgfmathtruncatemacro{\tikz@td@i}{sign(cos(\pgfkeysvalueof{/tikz/3d/phi}))}%
 \ifnum\tikz@td@i=-1\relax
 \pgfmathtruncatemacro{\tikz@td@i}{sign(cos(\pgfkeysvalueof{/tikz/3d/phi}))}%
-    \path[3d/cylinder/top] plot[variable=\tikz@td@t,domain=0:360,smooth cycle]
-    ({\pgfkeysvalueof{/tikz/3d/r}*cos(\tikz@td@t)},\pgfkeysvalueof{/tikz/3d/h},{\pgfkeysvalueof{/tikz/3d/r}*sin(\tikz@td@t)}) ;
+    \def\tikz@td@mantle{plot[variable=\tikz@td@t,domain=0:360,smooth cycle]
+    ({\pgfkeysvalueof{/tikz/3d/r}*cos(\tikz@td@t)},\pgfkeysvalueof{/tikz/3d/h},{\pgfkeysvalueof{/tikz/3d/r}*sin(\tikz@td@t)})}%
+    \tikz@td@cylinder@paintcap
+    \path[3d/cylinder/top] \tikz@td@mantle;
 \fi
 \ifnum\tikz@td@i=1\relax
-    \path[3d/cylinder/top] plot[variable=\tikz@td@t,domain=0:360,smooth cycle]
-    ({\pgfkeysvalueof{/tikz/3d/r}*cos(\tikz@td@t)},0,{\pgfkeysvalueof{/tikz/3d/r}*sin(\tikz@td@t)}) ;
+    \def\tikz@td@mantle{plot[variable=\tikz@td@t,domain=0:360,smooth cycle]
+    ({\pgfkeysvalueof{/tikz/3d/r}*cos(\tikz@td@t)},0,{\pgfkeysvalueof{/tikz/3d/r}*sin(\tikz@td@t)})}%
+    \tikz@td@cylinder@paintcap
+    \path[3d/cylinder/top] \tikz@td@mantle;
 \fi
 }},pics/cylinder/.style={code={%
 % arbitrary cylinder
 \tikzset{3d/.cd,#1}%
 \pgfmathsetmacro{\tikz@td@v}{TD("\pgfkeysvalueof{/tikz/3d/cylinder/axis}x(nscreenx,nscreeny,nscreenz)")}%
 \pgfmathtruncatemacro{\tikz@td@i}{abs(TD("(\tikz@td@v)o(\tikz@td@v)"))>0.01?1:0}%
-\ifnum\tikz@td@i=0\relax 
-  \path[3d/cylinder/top] circle[radius=\pgfkeysvalueof{/tikz/3d/r}];
+\pgfmathsetmacro{\tikz@td@ez}{TDunit("\pgfkeysvalueof{/tikz/3d/cylinder/axis}")}%
+\tikz@td@cylinder@cap{\tikz@td@ez}%
+\ifnum\tikz@td@i=0\relax % seen along the axis: only the cap facing the viewer
+  \def\tikz@td@mantle{circle[radius=\pgfkeysvalueof{/tikz/3d/r}]}%
+  \tikz@td@cylinder@paintcap
+  \path[3d/cylinder/top] \tikz@td@mantle;
 \else 
   \pgfmathsetmacro{\tikz@td@ex}{TDunit("\pgfkeysvalueof{/tikz/3d/cylinder/axis}x(nscreenx,nscreeny,nscreenz)")}%
   \pgfmathsetmacro{\tikz@td@ey}{TDunit("(\tikz@td@ex)x\pgfkeysvalueof{/tikz/3d/cylinder/axis}")}%
-  \pgfmathtruncatemacro{\tikz@td@i}{TD("\pgfkeysvalueof{/tikz/3d/cylinder/axis}o(nscreenx,nscreeny,nscreenz)")>0?1:0}%
-  \ifnum\tikz@td@i=1\relax 
-    \pgfmathsetmacro{\tikz@td@ey}{TD("-1*(\tikz@td@ey)")}%
-  \else
-    %\pgfmathsetmacro{\tikz@td@ex}{TD("-1*(\tikz@td@ex)")}%
-  \fi
+  % ex x axis points towards the viewer; the frame uses ey = -(ex x axis) so
+  % that the mantle (local y<0) is the half facing the viewer from either side
+  \pgfmathsetmacro{\tikz@td@ey}{TD("-1*(\tikz@td@ey)")}%
   \pgfmathsetmacro{\tikz@td@ez}{TDunit("\pgfkeysvalueof{/tikz/3d/cylinder/axis}")}%
+  \tikz@td@cylinder@light{\tikz@td@ex}{\tikz@td@ez}%
   \expanded{\noexpand\path[overlay,
 	3d coordinate={\pgfkeysvalueof{/tikz/3d/aux keys/ex}=(\tikz@td@ex)},
 	3d coordinate={\pgfkeysvalueof{/tikz/3d/aux keys/ey}=(\tikz@td@ey)},
@@ -2054,23 +2980,44 @@ create faces from vertex list/.style={/tikz/3d/polyhedron/create face from verti
   \begin{scope}[x/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ex}},
     y/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ey}},
     z/.expanded={\pgfkeysvalueof{/tikz/3d/aux keys/ez}}]       
+    % pieces: the rim behind, the mantle (centroid of its front half), the cap;
+    % the radius breaks ties with coplanar caps
+    \pgfmathsetmacro\tikz@td@kext{abs(\pgfkeysvalueof{/tikz/3d/r})}%
     \ifnum\tikz@td@i=1\relax 
-      \draw[3d/hidden] (\pgfkeysvalueof{/tikz/3d/r},0,0) arc[start angle=0,end angle=180,radius=\pgfkeysvalueof{/tikz/3d/r}];
+      \tikz@td@piece{(0,{2*abs(\pgfkeysvalueof{/tikz/3d/r})/pi},0)}{%
+      \draw[3d/hidden,3d/edge only] (\pgfkeysvalueof{/tikz/3d/r},0,0) arc[start angle=0,end angle=180,radius=\pgfkeysvalueof{/tikz/3d/r}];}%
     \else 
-      \draw[3d/hidden] (\pgfkeysvalueof{/tikz/3d/r},0,\pgfkeysvalueof{/tikz/3d/h}) arc[start angle=0,end angle=180,radius=\pgfkeysvalueof{/tikz/3d/r}];
+      \tikz@td@piece{(0,{2*abs(\pgfkeysvalueof{/tikz/3d/r})/pi},\pgfkeysvalueof{/tikz/3d/h})}{%
+      \draw[3d/hidden,3d/edge only] (\pgfkeysvalueof{/tikz/3d/r},0,\pgfkeysvalueof{/tikz/3d/h}) arc[start angle=0,end angle=180,radius=\pgfkeysvalueof{/tikz/3d/r}];}%
     \fi
-    \path[3d/cylinder/mantle]
-      let \p1=($(0,1,0)-(0,0,0)$),\n1={atan2(\y1,\x1)+180} in
-      [shading angle=\n1]
-      (\pgfkeysvalueof{/tikz/3d/r},0,0) arc[start angle=0,end angle=-180,radius=\pgfkeysvalueof{/tikz/3d/r}]
+    \def\tikz@td@mantle{(\pgfkeysvalueof{/tikz/3d/r},0,0) arc[start angle=0,end angle=-180,radius=\pgfkeysvalueof{/tikz/3d/r}]
         -- 
       ({-1*(\pgfkeysvalueof{/tikz/3d/r})},0,\pgfkeysvalueof{/tikz/3d/h}) arc[start angle=-180,end angle=0,radius=\pgfkeysvalueof{/tikz/3d/r}]
-      -- cycle;
+      -- cycle}%
+    \tikz@td@piece{(0,{-2*abs(\pgfkeysvalueof{/tikz/3d/r})/pi},{\pgfkeysvalueof{/tikz/3d/h}/2})}{%
+    \tikz@td@iffills{/tikz/3d/cylinder/mantle}{}{\path[3d/cylinder/lighting] \tikz@td@mantle;}%
+    % the outline turns back at the top corners: no miter spikes there
+    \path[line join=round,3d/cylinder/mantle]
+      let \p1=($(0,1,0)-(0,0,0)$),\n1={atan2(\y1,\x1)+180} in
+      [3d/cylinder/shading angle=\n1]
+      \tikz@td@mantle;}%
     \ifnum\tikz@td@i=1\relax 
-      \path[3d/cylinder/top] (0,0,\pgfkeysvalueof{/tikz/3d/h}) circle[radius=\pgfkeysvalueof{/tikz/3d/r}];
+      \def\pgfutil@tmpa{(0,0,\pgfkeysvalueof{/tikz/3d/h})}%
     \else 
-      \path[3d/cylinder/top] (0,0,0) circle[radius=\pgfkeysvalueof{/tikz/3d/r}];
+      \def\pgfutil@tmpa{(0,0,0)}%
     \fi
+    % the cap, with a hole of radius 3d/cylinder/hole (even odd rule)
+    \edef\tikz@td@mantle{\pgfutil@tmpa\space circle[radius=\pgfkeysvalueof{/tikz/3d/r}]
+      \ifdim\pgfkeysvalueof{/tikz/3d/cylinder/hole}pt>0pt
+        \pgfutil@tmpa\space circle[radius=\pgfkeysvalueof{/tikz/3d/cylinder/hole}]\fi}%
+    \expandafter\tikz@td@piece\expandafter{\pgfutil@tmpa}{%
+    \ifcsname tikz@td@open@\pgfkeysvalueof{/tikz/3d/cylinder/open}\endcsname
+      % open ends: only the rim
+      \path[3d/cylinder/top,3d/edge only] \tikz@td@mantle;
+    \else
+      \tikz@td@iffills{/tikz/3d/cylinder/top}{}{\tikz@td@cylinder@paintcap}%
+      \path[even odd rule,3d/cylinder/top] \tikz@td@mantle;
+    \fi}%
   \end{scope}  
 \fi
 }},%
@@ -2079,7 +3026,8 @@ mantle/.style={draw},top/.style={draw}}
 \tikzset{3d/.cd,visible/.style={draw,solid},
 	hidden/.style={draw,very thin,cheating dash},
 	r/.initial=1,h/.initial=1,R/.initial=2,
-  cylinder/axis/.initial={(0,0,1)}}
+  cylinder/axis/.initial={(0,0,1)},cylinder/hole/.initial=0,cylinder/open/.initial=false}%
+\expandafter\let\csname tikz@td@open@true\endcsname\relax
 %%
 %% decorations
 %% 
@@ -2096,12 +3044,14 @@ mantle/.style={draw},top/.style={draw}}
 	append path/.style={insert path/.expanded={-- \csname tikz@td@recorded@path@f@#1\endcsname}},%	
 	append reversed path/.style={insert path/.expanded={-- \csname tikz@td@recorded@path@r@#1\endcsname}},%	
 	first coordinate of/.style={insert path/.expanded={(\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#1-0)}},%	
-	last coordinate of/.style={insert path/.expanded={(\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#1-\the\numexpr\value{tikz@td@recorded@point})}},%	
+	last coordinate of/.style={insert path/.expanded={(\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#1-\csname tikz@td@recorded@path@last@#1\endcsname)}},%
 	coordinate with index/.style args={#1 of #2}{insert path/.expanded={(\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#2-#1)}},%	
 /tikz/extend stored path/.style={%
 	%/utils/exec=\typeout{\arabic{tikz@td@recorded@point}},
     decorate,decoration={show path construction,
     moveto code={\def\tikz@td@prefix{\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#1-}%
+	% do not overwrite the last coordinate of the previous subpath
+	\ifnum\value{tikz@td@recorded@point}>0 \stepcounter{tikz@td@recorded@point}\fi
 	\path (\tikzinputsegmentfirst) 
 		coordinate (\tikz@td@prefix\the\numexpr\value{tikz@td@recorded@point});
     \ifnum\value{tikz@td@recorded@point}=0
@@ -2116,8 +3066,9 @@ mantle/.style={draw},top/.style={draw}}
 	 \expandafter\xdef\csname tikz@td@recorded@path@r@#1\endcsname{% reverse
 	 	(\tikz@td@prefix\the\numexpr\value{tikz@td@recorded@point}) 
 		\csname tikz@td@recorded@path@r@#1\endcsname}%
-	\fi
-	\stepcounter{tikz@td@recorded@point}%	
+		\fi
+	\expandafter\xdef\csname tikz@td@recorded@path@last@#1\endcsname{\number\value{tikz@td@recorded@point}}%
+	\stepcounter{tikz@td@recorded@point}%
     },
     lineto code={\def\tikz@td@prefix{\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#1-}%
 	\path (\tikzinputsegmentfirst) 
@@ -2138,8 +3089,9 @@ mantle/.style={draw},top/.style={draw}}
 	 \expandafter\xdef\csname tikz@td@recorded@path@r@#1\endcsname{% reverse
 	 	(\tikz@td@prefix\the\numexpr\value{tikz@td@recorded@point}+1) --
 		\csname tikz@td@recorded@path@r@#1\endcsname}%
-	\fi
-	\stepcounter{tikz@td@recorded@point}%	
+		\fi
+	\stepcounter{tikz@td@recorded@point}%
+	\expandafter\xdef\csname tikz@td@recorded@path@last@#1\endcsname{\number\value{tikz@td@recorded@point}}%
     },
     curveto code={\def\tikz@td@prefix{\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#1-}%
       \path (\tikzinputsegmentfirst)
@@ -2173,9 +3125,10 @@ mantle/.style={draw},top/.style={draw}}
 		and (\tikz@td@prefix\the\numexpr\value{tikz@td@recorded@point}+1) ..
 		\csname tikz@td@recorded@path@r@#1\endcsname}%
 	\fi
-	\stepcounter{tikz@td@recorded@point}%	
-	\stepcounter{tikz@td@recorded@point}%	
-	\stepcounter{tikz@td@recorded@point}%	
+	\stepcounter{tikz@td@recorded@point}%
+	\stepcounter{tikz@td@recorded@point}%
+	\stepcounter{tikz@td@recorded@point}%
+	\expandafter\xdef\csname tikz@td@recorded@path@last@#1\endcsname{\number\value{tikz@td@recorded@point}}%
     },
     closepath code={\def\tikz@td@prefix{\pgfkeysvalueof{/tikz/stored path/coordinate prefix}#1-}%
 	\path (\tikzinputsegmentfirst) 
@@ -2194,9 +3147,11 @@ mantle/.style={draw},top/.style={draw}}
 	 	\csname tikz@td@recorded@path@f@#1\endcsname
 		--(\tikz@td@prefix\the\numexpr\value{tikz@td@recorded@point}+1)}%
 	 \expandafter\xdef\csname tikz@td@recorded@path@r@#1\endcsname{% reverse
-	 	(\tikz@td@prefix\the\numexpr\value{tikz@td@recorded@point}+1) --
+		 	(\tikz@td@prefix\the\numexpr\value{tikz@td@recorded@point}+1) --
 		\csname tikz@td@recorded@path@r@#1\endcsname}%
 	\fi
+	\stepcounter{tikz@td@recorded@point}%
+	\expandafter\xdef\csname tikz@td@recorded@path@last@#1\endcsname{\number\value{tikz@td@recorded@point}}%
 	  } }},
 /tikz/store path/.style={%	  
 	  /tikz/stored path/reset coordinate index,%
@@ -2237,18 +3192,20 @@ execute at end picture={%
 \tikz@td@bbox@store@aux{#1xmax}{\pgfutil@tmpc}%
 \tikz@td@bbox@store@aux{#1ymax}{\pgfutil@tmpd}%
 \ifdim\pgfutil@tmpa pt<16383.99999pt\relax
-\path (\pgfutil@tmpa pt,\pgfutil@tmpb pt) (\pgfutil@tmpc pt,\pgfutil@tmpd pt);
+\path[reset cm] (\pgfutil@tmpa pt,\pgfutil@tmpb pt) (\pgfutil@tmpc pt,\pgfutil@tmpd pt);
 \fi
 }},same bounding box/.default=A} 	  
 %% list management
 \newif\if@pgf@list@first@item
-\pgfkeys{/handlers/.add item/.code=\pgfkeys{\pgfkeyscurrentpath/.append={,#1}},
+\pgfkeys{/handlers/.add item/.code={\edef\pgfutil@tmpa{\pgfkeysvalueof{\pgfkeyscurrentpath}}%
+\ifx\pgfutil@tmpa\pgfutil@empty\pgfkeyssetvalue{\pgfkeyscurrentpath}{#1}%
+\else\pgfkeys{\pgfkeyscurrentpath/.append={,#1}}\fi},
 /handlers/.remove item/.code={%
 \edef\pgfutil@tmpa{\pgfkeysvalueof{\pgfkeyscurrentpath}}%
 \edef\pgfutil@tmpb{#1}%
 \edef\pgfutil@tmpc{\noexpand\@removeelement{\pgfutil@tmpb}{\pgfutil@tmpa}{\noexpand\pgfutil@tmpa}}%
 \pgfutil@tmpc
-\pgfkeyssetvalue{\pgfkeyscurrentpath}{\pgfutil@tmpa}},% maybe test if the list is now empty?
+\pgfkeyslet{\pgfkeyscurrentpath}{\pgfutil@tmpa}},% maybe test if the list is now empty?
 /handlers/.count/.code={\begingroup%
 \edef\pgfutil@tmpl{\pgfkeysvalueof{\pgfkeyscurrentpath}}%
 \c@pgf@counta0\relax
@@ -2270,51 +3227,7 @@ execute at end picture={%
 \pgfkeys{\pgfkeysvalueof{/list management/current array}/dim/.initial=\the\c@pgf@counta}%
 \pgfkeys{\pgfkeysvalueof{/list management/current array}/content/.initial={#1}}%
 }}},
-/handlers/.sort numeric list/.code 2 args={\begingroup%
-\edef\pgfutil@tmpl{\pgfkeysvalueof{\pgfkeyscurrentpath}}%
-\edef\pgfutil@tmpa{0}%
-\pgfutil@for\pgfutil@tmpb:={\pgfutil@tmpl}\do{% build an indexed array and 
-\edef\pgfutil@tmpa{\the\numexpr\pgfutil@tmpa+1}% precompute expressions used in comparison
-\ifcase\pgfutil@tmpa
-\or
-\or
-\edef\pgfutil@tmph{2}%
-\else
-\edef\pgfutil@tmph{\pgfutil@tmph,\pgfutil@tmpa}%
-\fi
-\pgfkeys{/list management/sort map=\pgfutil@tmpb}%
-\expandafter\edef\csname pgfutil@tmpd@\pgfutil@tmpa\endcsname{\pgfmathresult}%
-\expandafter\edef\csname pgfutil@tmpf@\pgfutil@tmpa\endcsname{\pgfutil@tmpa}%
-}%
-\edef\pgfutil@tmps{\pgfkeysvalueof{/list management/sort comparison}}%
-\pgfutil@loop
-\edef\pgfutil@tmpi{1}%
-\pgfutil@for\pgfutil@tmpb:={\pgfutil@tmph}\do{%
-\edef\pgfutil@tmpx{\@nameuse{pgfutil@tmpd@\pgfutil@tmpb}}%
-\edef\pgfutil@tmpc{\the\numexpr\pgfutil@tmpb-1}%
-\edef\pgfutil@tmpy{\@nameuse{pgfutil@tmpd@\pgfutil@tmpc}}%
-\edef\pgfutil@tmpr{(\pgfutil@tmpx\pgfutil@tmps\pgfutil@tmpy?1:0)}%
-\pgfmathtruncatemacro\pgfutil@tmpj{\pgfutil@tmpr}%
-\ifnum\pgfutil@tmpj=0\relax
-\edef\pgfutil@tmpi{0}%
-\edef\pgfutil@tmpu{\@nameuse{pgfutil@tmpf@\pgfutil@tmpb}}%
-\edef\pgfutil@tmpv{\@nameuse{pgfutil@tmpf@\pgfutil@tmpc}}%
-%\typeout{swap (\pgfutil@tmpu<->\pgfutil@tmpv) and (\pgfutil@tmpx<->\pgfutil@tmpy)}%
-\expandafter\edef\csname pgfutil@tmpd@\pgfutil@tmpb\endcsname{\pgfutil@tmpy}%
-\expandafter\edef\csname pgfutil@tmpd@\pgfutil@tmpc\endcsname{\pgfutil@tmpx}%
-\expandafter\edef\csname pgfutil@tmpf@\pgfutil@tmpb\endcsname{\pgfutil@tmpv}%
-\expandafter\edef\csname pgfutil@tmpf@\pgfutil@tmpc\endcsname{\pgfutil@tmpu}%
-\fi
-}%
-\ifnum\pgfutil@tmpi=0\relax
-\pgfutil@repeat
-\edef\pgfutil@tmpa{\@nameuse{pgfutil@tmpf@1}}%
-\edef\pgfutil@tmpc{\@nameuse{pgfutil@tmpd@1}}%
-\pgfutil@for\pgfutil@tmpb:={\pgfutil@tmph}\do{%
-\edef\pgfutil@tmpa{\pgfutil@tmpa,\@nameuse{pgfutil@tmpf@\pgfutil@tmpb}}%
-\edef\pgfutil@tmpc{\pgfutil@tmpc,\@nameuse{pgfutil@tmpd@\pgfutil@tmpb}}}%
-\edef\pgfutil@tmpb{\noexpand\edef\noexpand#1{\pgfutil@tmpc}\noexpand\edef\noexpand#2{\pgfutil@tmpa}}%
-\pgfmathsmuggle\pgfutil@tmpb\endgroup\pgfutil@tmpb},
+/handlers/.sort numeric list/.code 2 args={\tikz@td@sort@numeric#1#2},
 /list management/.cd,print item/.code={#1},
 print item in list/.code={%
 \if@pgf@list@first@item
@@ -2719,9 +3632,824 @@ create shading/.code={%
     \pgfkeysvalueof{/tikz/3d/cone/shading/brightness} mul     % brightness*(1 + sin(theta))
     dup mul     % [f*(1 + sin(theta))]^2
 	2 mul
+	dup 1 gt {pop 1} if
 	dup dup		% important so that it gets three color components
+	\ifpgfshadingmodelcmyk\pgffuncshadingrgbtocmyk\fi
+	\ifpgfshadingmodelgray\pgffuncshadingrgbtogray\fi
 }}}
 \tikzset{3d/cone shading/.style={3d/cone/shading/create shading={#1},
  shading=simple cone \number\value{tikz@td@cone@shading}}}
+%% lighting
+%% One directional light. 3d/light is the direction pointing towards the light,
+%% given in the 3d frame in which coordinates are specified (the frame of
+%% install view), so it stays fixed in the scene when the view changes.
+%% Intensity of a surface element with unit outward normal n (Lambert):
+%%   I = min(1, ambient + diffuse*max(0, n.L)),  colour = <color>!100I!black
+\newcounter{tikz@td@lit}%
+\newcount\tikz@td@k
+\tikzset{3d/light/.initial={(1,1,1)},%
+  3d/light/ambient/.initial=0.5,3d/light/diffuse/.initial=0.5,%
+  3d/cylinder/color/.initial=white,3d/cone/color/.initial=white,%
+  % painted below 3d/cylinder/mantle, so a fill or shading there wins
+  3d/cylinder/lighting/.style={path picture={\tikz@td@cyl@paint}},%
+  % orients a user shading of the mantle across the axis without forcing one
+  3d/cylinder/shading angle/.code={\edef\tikz@shade@angle{#1}},%
+  % cone hook 3d/cone/light shading: #1 = canvas angle (degrees, around the
+  % tip) of the brightest visible generator; lit/max and lit/min are the
+  % intensities of the brightest and darkest visible generators
+  3d/cone/lit/max/.initial=1,3d/cone/lit/min/.initial=0.5,%
+  3d/cone/lit side/.code={%
+    \pgfkeyssetvalue{/tikz/3d/cone/lit/max}{\csname tikz@td@cone@#1@max\endcsname}%
+    \pgfkeyssetvalue{/tikz/3d/cone/lit/min}{\csname tikz@td@cone@#1@min\endcsname}%
+    \expandafter\let\expandafter\tikz@td@cone@ps\csname tikz@td@cone@#1@ps\endcsname
+    \pgfkeysalso{/tikz/3d/cone/light shading/.expanded=\csname tikz@td@cone@#1@angle\endcsname}},%
+  3d/cone/light shading/.code={\tikz@td@cone@shade{#1}}}%
+\pgfmathdeclarefunction{tikztdlight}{1}{%
+  \begingroup
+  \pgfmathparse{max(0,min(1,\pgfkeysvalueof{/tikz/3d/light/ambient}%
+    +\pgfkeysvalueof{/tikz/3d/light/diffuse}*max(0,#1)))}%
+  \pgfmathsmuggle\pgfmathresult\endgroup}%
+\def\tikz@td@splitvec#1,#2,#3\relax#4{%
+  \expandafter\edef\csname tikz@td@l@#4x\endcsname{#1}%
+  \expandafter\edef\csname tikz@td@l@#4y\endcsname{#2}%
+  \expandafter\edef\csname tikz@td@l@#4z\endcsname{#3}}%
+% \tikz@td@l@L{x,y,z}, \tikz@td@l@N{x,y,z}: unit light direction, unit screen normal
+\def\tikz@td@getlight{%
+  \edef\pgfutil@tmpa{\pgfkeysvalueof{/tikz/3d/light}}%
+  \pgfmathsetmacro\pgfutil@tmpa{TDunit("\pgfutil@tmpa")}%
+  \expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{L}%
+  \pgfmathsetmacro\pgfutil@tmpa{TDunit("(nscreenx,nscreeny,nscreenz)")}%
+  \expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{N}}%
+% \tikz@td@canvas{<x>}{<y>}{<z>}{<name>}: canvas point -> \tikz@td@<name>x/y (pt)
+\def\tikz@td@canvas#1#2#3#4{%
+  \pgfpointtransformed{\pgfpointxyz{#1}{#2}{#3}}%
+  \expandafter\edef\csname tikz@td@l@#4x\endcsname{\the\pgf@x}%
+  \expandafter\edef\csname tikz@td@l@#4y\endcsname{\the\pgf@y}}%
+% Cylinder of radius 3d/r and height 3d/h, base centre at the origin.
+% #1 = unit vector across the silhouette, #2 = unit axis (x,y,z, current frame).
+% In parallel projection the mantle brightness only depends on s in [-1,1],
+% the position across the silhouette; the visible normal is s*e + sqrt(1-s^2)*w
+% (w: normal facing the viewer), so an axial shading is exact.
+% Defines \tikz@td@cyl@paint (used by 3d/cylinder/lighting).
+\def\tikz@td@cylinder@light#1#2{%
+  \let\tikz@td@cyl@paint\pgfutil@empty
+  \tikz@td@getlight
+  \edef\pgfutil@tmpa{#1}\expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{e}%
+  \edef\pgfutil@tmpa{#2}\expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{a}%
+  \pgfmathsetmacro\tikz@td@l@r{abs(\pgfkeysvalueof{/tikz/3d/r})}%
+  \pgfmathsetmacro\tikz@td@l@h{\pgfkeysvalueof{/tikz/3d/h}}%
+  \pgfmathsetmacro\pgfutil@tmpb{\tikz@td@l@Nx*\tikz@td@l@ax+\tikz@td@l@Ny*\tikz@td@l@ay+\tikz@td@l@Nz*\tikz@td@l@az}%
+  \pgfmathsetmacro\tikz@td@l@wx{\tikz@td@l@Nx-\pgfutil@tmpb*\tikz@td@l@ax}%
+  \pgfmathsetmacro\tikz@td@l@wy{\tikz@td@l@Ny-\pgfutil@tmpb*\tikz@td@l@ay}%
+  \pgfmathsetmacro\tikz@td@l@wz{\tikz@td@l@Nz-\pgfutil@tmpb*\tikz@td@l@az}%
+  \pgfmathsetmacro\pgfutil@tmpb{sqrt(\tikz@td@l@wx*\tikz@td@l@wx+\tikz@td@l@wy*\tikz@td@l@wy+\tikz@td@l@wz*\tikz@td@l@wz)}%
+  \pgfmathsetmacro\pgfutil@tmpc{sqrt(\tikz@td@l@ex*\tikz@td@l@ex+\tikz@td@l@ey*\tikz@td@l@ey+\tikz@td@l@ez*\tikz@td@l@ez)}%
+  \ifnum\fpeval{\pgfutil@tmpb>0.01}=1\relax\ifnum\fpeval{\pgfutil@tmpc>0.5}=1\relax
+  \pgfmathsetmacro\tikz@td@l@Le{\tikz@td@l@Lx*\tikz@td@l@ex+\tikz@td@l@Ly*\tikz@td@l@ey+\tikz@td@l@Lz*\tikz@td@l@ez}%
+  \pgfmathsetmacro\tikz@td@l@Lw{(\tikz@td@l@Lx*\tikz@td@l@wx+\tikz@td@l@Ly*\tikz@td@l@wy+\tikz@td@l@Lz*\tikz@td@l@wz)/\pgfutil@tmpb}%
+  % canvas: centre c, c + r e, c + (h/2) a
+  \pgfmathsetmacro\pgfutil@tmpa{\tikz@td@l@h/2}%
+  \tikz@td@canvas{\pgfutil@tmpa*\tikz@td@l@ax}{\pgfutil@tmpa*\tikz@td@l@ay}{\pgfutil@tmpa*\tikz@td@l@az}{c}%
+  \tikz@td@canvas{\pgfutil@tmpa*\tikz@td@l@ax+\tikz@td@l@r*\tikz@td@l@ex}%
+    {\pgfutil@tmpa*\tikz@td@l@ay+\tikz@td@l@r*\tikz@td@l@ey}%
+    {\pgfutil@tmpa*\tikz@td@l@az+\tikz@td@l@r*\tikz@td@l@ez}{u}%
+  \tikz@td@canvas{2*\pgfutil@tmpa*\tikz@td@l@ax}{2*\pgfutil@tmpa*\tikz@td@l@ay}{2*\pgfutil@tmpa*\tikz@td@l@az}{t}%
+  \pgfmathsetmacro\tikz@td@l@angle{atan2(\tikz@td@l@uy-\tikz@td@l@cy,\tikz@td@l@ux-\tikz@td@l@cx)}%
+  \pgfmathsetmacro\tikz@td@l@rc{veclen(\tikz@td@l@uy-\tikz@td@l@cy,\tikz@td@l@ux-\tikz@td@l@cx)}%
+  \pgfmathsetmacro\tikz@td@l@D{2*\tikz@td@l@rc+2*veclen(\tikz@td@l@ty-\tikz@td@l@cy,\tikz@td@l@tx-\tikz@td@l@cx)+1}%
+  % pgf maps the central 50bp of the shading onto the 2D x 2D square below
+  \pgfmathsetmacro\tikz@td@l@q{25*\tikz@td@l@rc/\tikz@td@l@D}%
+  \colorlet{tikz@td@base}{\pgfkeysvalueof{/tikz/3d/cylinder/color}}%
+  \tikz@td@k=0
+  \loop
+    \pgfmathsetmacro\tikz@td@l@s{-cos(11.25*\tikz@td@k)}%
+    \pgfmathsetmacro\tikz@td@l@I{100*tikztdlight(\tikz@td@l@s*\tikz@td@l@Le+sin(11.25*\tikz@td@k)*\tikz@td@l@Lw)}%
+    \pgfmathsetmacro\tikz@td@l@p{50+\tikz@td@l@q*\tikz@td@l@s}%
+    \ifnum\tikz@td@k=0
+      \edef\tikz@td@l@spec{color(0bp)=(tikz@td@base!\tikz@td@l@I!black);}%
+    \fi
+    \edef\tikz@td@l@spec{\tikz@td@l@spec color(\tikz@td@l@p bp)=(tikz@td@base!\tikz@td@l@I!black);}%
+    \advance\tikz@td@k by1
+  \ifnum\tikz@td@k<17 \repeat
+  \stepcounter{tikz@td@lit}%
+  \edef\tikz@td@l@litname{tikz@td@lit@\number\value{tikz@td@lit}}%
+  \edef\pgfutil@tmpa{\noexpand\pgfdeclarehorizontalshading{\tikz@td@l@litname}{100bp}%
+    {\tikz@td@l@spec color(100bp)=(tikz@td@base!\tikz@td@l@I!black)}}%
+  \pgfutil@tmpa
+  \pgfmathsetmacro\pgfutil@tmpa{\tikz@td@l@cx-\tikz@td@l@D}%
+  \pgfmathsetmacro\pgfutil@tmpb{\tikz@td@l@cy-\tikz@td@l@D}%
+  \pgfmathsetmacro\pgfutil@tmpc{\tikz@td@l@cx+\tikz@td@l@D}%
+  \pgfmathsetmacro\pgfutil@tmpd{\tikz@td@l@cy+\tikz@td@l@D}%
+  \edef\tikz@td@cyl@paint{\noexpand\pgftransformreset
+    \noexpand\pgfpathrectanglecorners{\noexpand\pgfqpoint{\pgfutil@tmpa pt}{\pgfutil@tmpb pt}}%
+      {\noexpand\pgfqpoint{\pgfutil@tmpc pt}{\pgfutil@tmpd pt}}%
+    \noexpand\pgfshadepath{\tikz@td@l@litname}{\tikz@td@l@angle}%
+    \noexpand\pgfusepath{discard}}%
+  \fi\fi}%
+% End caps are flat: the visible cap (outward normal n = +-#1, the sign that
+% faces the viewer) gets the constant intensity tikztdlight(n.L).
+% #1 = unit axis (x,y,z, current frame). Defines the colour tikz@td@l@cap.
+\def\tikz@td@cylinder@cap#1{%
+  \tikz@td@getlight
+  \edef\pgfutil@tmpa{#1}\expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{a}%
+  \pgfmathsetmacro\pgfutil@tmpb{\tikz@td@l@Nx*\tikz@td@l@ax+\tikz@td@l@Ny*\tikz@td@l@ay+\tikz@td@l@Nz*\tikz@td@l@az<0?-1:1}%
+  \pgfmathsetmacro\pgfutil@tmpb{100*tikztdlight(\pgfutil@tmpb*(\tikz@td@l@Lx*\tikz@td@l@ax+\tikz@td@l@Ly*\tikz@td@l@ay+\tikz@td@l@Lz*\tikz@td@l@az))}%
+  \colorlet{tikz@td@l@cap}{\pgfkeysvalueof{/tikz/3d/cylinder/color}}%
+  \colorlet{tikz@td@l@cap}{tikz@td@l@cap!\pgfutil@tmpb!black}}%
+% paints the cap path \tikz@td@mantle through 3d/cylinder/lighting (below
+% 3d/cylinder/top, so a fill there wins)
+% \tikz@td@iffills{<style>}{<true>}{<false>}: does <style> fill or shade a path?
+% (then the lighting below it would only show through a translucent fill)
+\def\tikz@td@iffills#1{%
+  \begingroup
+    \let\tikz@mode\pgfutil@empty\tikz@mode@fillfalse\tikz@mode@shadefalse
+    \tikzset{#1}\tikz@mode
+    \iftikz@mode@fill\aftergroup\pgfutil@firstoftwo
+    \else\iftikz@mode@shade\aftergroup\pgfutil@firstoftwo
+    \else\aftergroup\pgfutil@secondoftwo\fi\fi
+  \endgroup}%
+\def\tikz@td@cylinder@paintcap{%
+  \begingroup
+  \def\tikz@td@cyl@paint{%
+    \pgfpathrectanglecorners{\pgfpointanchor{path picture bounding box}{south west}}%
+      {\pgfpointanchor{path picture bounding box}{north east}}%
+    \pgfsetfillcolor{tikz@td@l@cap}\pgfusepath{fill}}%
+  \path[even odd rule,3d/cylinder/lighting] \tikz@td@mantle;
+  \endgroup}%
+% Cone with base radius 3d/r, base centre #4, tip #4 + 3d/h * #3, base spanned by
+% #1, #2 (orthonormal frame, x,y,z strings, current frame). Outward normal at
+% azimuth p: (|h| cos p, |h| sin p, sgn(h) r)/sqrt(h^2+r^2) in that frame.
+% For each side (outer: n.N>0, inner: n.N<0, normal flipped) stores
+% \tikz@td@cone@<side>@angle/max/min/ps for 3d/cone/lit side.
+\def\tikz@td@cone@light#1#2#3#4{%
+  \tikz@td@getlight
+  \edef\pgfutil@tmpa{#1}\expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{f}%
+  \edef\pgfutil@tmpa{#2}\expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{g}%
+  \edef\pgfutil@tmpa{#3}\expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{a}%
+  \edef\pgfutil@tmpa{#4}\expandafter\tikz@td@splitvec\pgfutil@tmpa\relax{o}%
+  \pgfmathsetmacro\tikz@td@l@r{abs(\pgfkeysvalueof{/tikz/3d/r})}%
+  \pgfmathsetmacro\tikz@td@l@h{\pgfkeysvalueof{/tikz/3d/h}}%
+  \pgfmathsetmacro\tikz@td@l@sg{\tikz@td@l@h<0?-1:1}%
+  \pgfmathsetmacro\tikz@td@l@hh{abs(\tikz@td@l@h)}%
+  \pgfmathsetmacro\tikz@td@l@S{max(0.0001,veclen(\tikz@td@l@h,\tikz@td@l@r))}%
+  \def\tikz@td@l@dot##1##2{\csname tikz@td@l@##1x\endcsname*\csname tikz@td@l@##2x\endcsname
+    +\csname tikz@td@l@##1y\endcsname*\csname tikz@td@l@##2y\endcsname
+    +\csname tikz@td@l@##1z\endcsname*\csname tikz@td@l@##2z\endcsname}%
+  \pgfmathsetmacro\tikz@td@l@Lf{\tikz@td@l@dot{L}{f}}%
+  \pgfmathsetmacro\tikz@td@l@Lg{\tikz@td@l@dot{L}{g}}%
+  \pgfmathsetmacro\tikz@td@l@La{\tikz@td@l@dot{L}{a}}%
+  \pgfmathsetmacro\tikz@td@l@Nf{\tikz@td@l@dot{N}{f}}%
+  \pgfmathsetmacro\tikz@td@l@Ng{\tikz@td@l@dot{N}{g}}%
+  \pgfmathsetmacro\tikz@td@l@Na{\tikz@td@l@dot{N}{a}}%
+  \pgfmathsetmacro\tikz@td@l@phiL{atan2(\tikz@td@l@Lg,\tikz@td@l@Lf)}%
+  \pgfmathsetmacro\tikz@td@l@phiN{atan2(\tikz@td@l@Ng,\tikz@td@l@Nf)}%
+  % outer generators are visible for cos(p-phiN) > kappa
+  \pgfmathsetmacro\pgfutil@tmpb{\tikz@td@l@hh*veclen(\tikz@td@l@Nf,\tikz@td@l@Ng)}%
+  % pgfmath evaluates both branches of ?:, so keep |kappa|>1 (axis towards
+  % the viewer, where kappa may also exceed the dimension limit) out of acos
+  \pgfmathsetmacro\pgfutil@tmpc{\tikz@td@l@r*abs(\tikz@td@l@Na)}%
+  \ifdim\pgfutil@tmpc pt<\pgfutil@tmpb pt\relax
+    \pgfmathsetmacro\tikz@td@l@beta{acos(-\tikz@td@l@sg*\tikz@td@l@r*\tikz@td@l@Na/\pgfutil@tmpb)}%
+  \else
+    \pgfmathsetmacro\tikz@td@l@beta{-\tikz@td@l@sg*\tikz@td@l@Na>0?0:180}%
+  \fi
+  \tikz@td@canvas{\tikz@td@l@ox+\tikz@td@l@h*\tikz@td@l@ax}{\tikz@td@l@oy+\tikz@td@l@h*\tikz@td@l@ay}%
+    {\tikz@td@l@oz+\tikz@td@l@h*\tikz@td@l@az}{tip}%
+  \tikz@td@cone@side{outer}{1}{\tikz@td@l@phiN}{\tikz@td@l@beta}%
+  \tikz@td@cone@side{inner}{-1}{\tikz@td@l@phiN+180}{180-\tikz@td@l@beta}}%
+% #1 = side, #2 = +1/-1 (normal orientation), #3 = centre, #4 = half width of
+% the visible azimuth arc. Brightness is constant along each generator, so on
+% the canvas it is a function of the angle psi around the tip only. It is
+% sampled at 25 generators of the visible arc and stored as Type 4 code that
+% maps psi (on the stack) to the intensity: \tikz@td@cone@<side>@ps.
+\def\tikz@td@cone@side#1#2#3#4{%
+  \pgfmathsetmacro\tikz@td@l@m{#3}%
+  \pgfmathsetmacro\tikz@td@l@b{#4}%
+  \def\tikz@td@l@sig{#2}%
+  \let\tikz@td@l@cmax\relax
+  \pgfmathsetmacro\tikz@td@l@pL{#2>0?\tikz@td@l@phiL:\tikz@td@l@phiL+180}%
+  \tikz@td@cone@try{\tikz@td@l@m-\tikz@td@l@b}%
+  \tikz@td@cone@try{\tikz@td@l@m+\tikz@td@l@b}%
+  \tikz@td@cone@tryin{\tikz@td@l@pL}%
+  \tikz@td@cone@tryin{\tikz@td@l@pL+180}%
+  \tikz@td@cone@psi{\tikz@td@l@pmax}%
+  \expandafter\let\csname tikz@td@cone@#1@angle\endcsname\pgfmathresult
+  \pgfmathsetmacro\pgfutil@tmpa{tikztdlight(\tikz@td@l@cmax)}%
+  \expandafter\let\csname tikz@td@cone@#1@max\endcsname\pgfutil@tmpa
+  \pgfmathsetmacro\pgfutil@tmpa{tikztdlight(\tikz@td@l@cmin)}%
+  \expandafter\let\csname tikz@td@cone@#1@min\endcsname\pgfutil@tmpa
+  % profile: t_j = psi_j - psi_0 (orientation fixed by \tikz@td@l@dir), unwrapped
+  \tikz@td@k=0
+  \loop
+    \pgfmathsetmacro\tikz@td@l@p{\tikz@td@l@m-\tikz@td@l@b+\tikz@td@l@b*\tikz@td@k/12}%
+    \tikz@td@cone@try{\tikz@td@l@p}% sets \tikz@td@l@c
+    \pgfmathsetmacro\tikz@td@l@I{tikztdlight(\tikz@td@l@c)}%
+    \tikz@td@cone@psi{\tikz@td@l@p}%
+    \ifnum\tikz@td@k=0
+      \let\tikz@td@l@psiz\pgfmathresult
+      \def\tikz@td@l@t{0}\def\tikz@td@l@dir{1}%
+      \let\tikz@td@l@Iz\tikz@td@l@I
+      \let\tikz@td@l@ps\pgfutil@empty
+    \else
+      \pgfmathsetmacro\pgfutil@tmpa{\pgfmathresult-\tikz@td@l@psiz}%
+      \ifnum\tikz@td@k=1
+        \pgfmathsetmacro\tikz@td@l@dir{mod(\pgfutil@tmpa+720,360)>180?-1:1}%
+      \fi
+      \pgfmathsetmacro\pgfutil@tmpa{mod(\tikz@td@l@dir*\pgfutil@tmpa+720,360)}%
+      \pgfmathsetmacro\pgfutil@tmpa{\pgfutil@tmpa<\tikz@td@l@t-0.001?\pgfutil@tmpa+360:\pgfutil@tmpa}%
+      \pgfmathsetmacro\pgfutil@tmpb{\pgfutil@tmpa-\tikz@td@l@t}%
+      \ifnum\fpeval{\pgfutil@tmpb>0.0001}=1\relax
+        \pgfmathsetmacro\pgfutil@tmpc{(\tikz@td@l@I-\tikz@td@l@Ilast)/\pgfutil@tmpb}%
+        % acc += slope*clip(t - t_{j-1}, 0, dt); stack: t acc
+        \edef\tikz@td@l@ps{\tikz@td@l@ps\space 1 index \tikz@td@l@t\space sub
+          dup 0 lt {pop 0} if dup \pgfutil@tmpb\space gt {pop \pgfutil@tmpb} if
+          \pgfutil@tmpc\space mul add}%
+        \let\tikz@td@l@t\pgfutil@tmpa
+      \fi
+    \fi
+    \let\tikz@td@l@Ilast\tikz@td@l@I
+    \advance\tikz@td@k by1
+  \ifnum\tikz@td@k<25 \repeat
+  % centre the unused angular gap around the arc so that pixels just outside
+  % the silhouette clamp to the nearest end
+  \pgfmathsetmacro\pgfutil@tmpa{max(0,(360-\tikz@td@l@t)/2)}%
+  \pgfmathsetmacro\pgfutil@tmpb{mod(\tikz@td@l@psiz-\tikz@td@l@dir*\pgfutil@tmpa+720,360)}%
+  \expandafter\edef\csname tikz@td@cone@#1@ps\endcsname{%
+    \pgfutil@tmpb\space sub \ifdim\tikz@td@l@dir pt<0pt neg \fi
+    dup 0 lt {360 add} if
+    \pgfutil@tmpa\space sub \tikz@td@l@Iz\space\tikz@td@l@ps\space exch pop}}%
+\def\tikz@td@cone@try#1{%
+  \pgfmathsetmacro\tikz@td@l@p{#1}%
+  \pgfmathsetmacro\tikz@td@l@c{\tikz@td@l@sig*(\tikz@td@l@hh*(cos(\tikz@td@l@p)*\tikz@td@l@Lf
+    +sin(\tikz@td@l@p)*\tikz@td@l@Lg)+\tikz@td@l@sg*\tikz@td@l@r*\tikz@td@l@La)/\tikz@td@l@S}%
+  \ifx\tikz@td@l@cmax\relax
+    \let\tikz@td@l@cmax\tikz@td@l@c\let\tikz@td@l@pmax\tikz@td@l@p
+    \let\tikz@td@l@cmin\tikz@td@l@c\let\tikz@td@l@pmin\tikz@td@l@p
+  \else
+    \ifdim\tikz@td@l@c pt>\tikz@td@l@cmax pt\relax
+      \let\tikz@td@l@cmax\tikz@td@l@c\let\tikz@td@l@pmax\tikz@td@l@p\fi
+    \ifdim\tikz@td@l@c pt<\tikz@td@l@cmin pt\relax
+      \let\tikz@td@l@cmin\tikz@td@l@c\let\tikz@td@l@pmin\tikz@td@l@p\fi
+  \fi}%
+\def\tikz@td@cone@tryin#1{%
+  \pgfmathsetmacro\pgfutil@tmpa{#1-\tikz@td@l@m}%
+  \pgfmathsetmacro\pgfutil@tmpa{abs(\pgfutil@tmpa-360*round(\pgfutil@tmpa/360))}%
+  \ifdim\pgfutil@tmpa pt>\tikz@td@l@b pt\else\tikz@td@cone@try{#1}\fi}%
+% canvas angle of the generator from the tip to the base point at azimuth #1
+\def\tikz@td@cone@psi#1{%
+  \pgfmathsetmacro\pgfutil@tmpb{\tikz@td@l@r*cos(#1)}%
+  \pgfmathsetmacro\pgfutil@tmpc{\tikz@td@l@r*sin(#1)}%
+  \tikz@td@canvas{\tikz@td@l@ox+\pgfutil@tmpb*\tikz@td@l@fx+\pgfutil@tmpc*\tikz@td@l@gx}%
+    {\tikz@td@l@oy+\pgfutil@tmpb*\tikz@td@l@fy+\pgfutil@tmpc*\tikz@td@l@gy}%
+    {\tikz@td@l@oz+\pgfutil@tmpb*\tikz@td@l@fz+\pgfutil@tmpc*\tikz@td@l@gz}{bp}%
+  \pgfmathparse{atan2(\tikz@td@l@bpy-\tikz@td@l@tipy,\tikz@td@l@bpx-\tikz@td@l@tipx)}}%
+% default 3d/cone/light shading: functional shading in the angle around the tip
+% using the exact profile of the current side (#1 is not needed here)
+\def\tikz@td@cone@shade#1{%
+  \pgfshadecolortorgb{\pgfkeysvalueof{/tikz/3d/cone/color}}{\tikz@td@l@rgb}%
+  \stepcounter{tikz@td@lit}%
+  \edef\tikz@td@l@litname{tikz@td@lit@\number\value{tikz@td@lit}}%
+  \pgfdeclarefunctionalshading{\tikz@td@l@litname}{\pgfpoint{-25bp}{-25bp}}%
+   {\pgfpoint{25bp}{25bp}}{}{%
+    exch 0.00001 add atan \tikz@td@cone@ps\space
+    dup 0 lt {pop 0} if dup 1 gt {pop 1} if
+    dup \tikz@td@l@rgbred mul exch dup \tikz@td@l@rgbgreen mul exch \tikz@td@l@rgbblue mul
+    \ifpgfshadingmodelcmyk\pgffuncshadingrgbtocmyk\fi
+    \ifpgfshadingmodelgray\pgffuncshadingrgbtogray\fi}%
+  \pgfkeysalso{/tikz/shading/.expanded=\tikz@td@l@litname}}%
+%%
+%% scenes: automatic occlusion
+%% Inside a scope with 3d/scene every path is a piece. TikZ builds it as usual
+%% (bounding box, names and nodes are unaffected), but its output goes to a box
+%% of its own. At the end of the scope the boxes are emitted from back to front
+%% (painter's algorithm; the sort is stable). The depth of a path is the mean
+%% depth of the points it visits; the pics of the library split themselves into
+%% pieces with explicit depths (\tikz@td@piece). A piece also records a point
+%% (canvas position and depth) and a canvas box around it, which serve for
+%% - ties: pieces of equal depth (e.g. coplanar caps) are painted larger first
+%%   (extent \tikz@td@kext);
+%% - straight paths whose depth varies by more than 3d/split: the box is emitted
+%%   in runs, clipped to bands across the path, cut at the depths of the pieces
+%%   near it, so the path can pass through them;
+%% - spheres (3d/sphere): what is inside stays between the back and the front
+%%   shell, what is on the surface goes just in front of the shell it lies on,
+%%   what is outside goes behind or in front of the whole sphere.
+%% A piece goes to the layer that was active when it began. The graphic state
+%% set by scopes inside the scene (line width, dash, colors, opacity, cap,
+%% join) is replayed in every piece; clips and transparency groups of such
+%% scopes are not.
+\newif\iftikz@td@scene % local: inside 3d/scene
+\newif\iftikz@td@explicit % local: inside an explicit piece, no automatic ones
+\newif\iftikz@td@pfill % global: the current path fills or shades
+\newcount\tikz@td@npieces
+\let\tikz@td@piece@idx\relax
+\let\tikz@td@scene@state\pgfutil@empty
+\def\tikz@td@kext{0}%
+\def\tikz@td@knosphere{0}% 1: the piece is placed with respect to a sphere already
+\let\tikz@td@orig@command@path\tikz@@command@path
+\def\tikz@td@scene@path{%
+  \iftikz@td@explicit\else\ifx\pgfpictureid\tikz@td@scene@pic % not in a nested picture
+    \global\tikz@td@pfillfalse
+    \tikz@td@piece@open{}%
+    \def\tikz@path@do@at@end{\tikz@td@piece@close@path\tikz@path@do@at@end}%
+  \fi\fi
+  \tikz@td@orig@command@path}%
+\let\tikz@td@orig@finish\tikz@finish
+\def\tikz@finish{%
+  \iftikz@td@scene\begingroup\tikz@mode
+    \iftikz@mode@fill\global\tikz@td@pfilltrue\fi
+    \iftikz@mode@shade\global\tikz@td@pfilltrue\fi
+  \endgroup\fi
+  \tikz@td@orig@finish}%
+% \tikz@td@depthof{<spec>}: \tikz@td@depthval is empty for an empty <spec>,
+% front, back, or the absolute depth (pt, larger is closer to the viewer) of
+% the point <spec> = (<coordinate>) in the current coordinate system; then
+% \tikz@td@depthpt is {canvas x}{canvas y}{depth} of the point (else empty)
+\def\tikz@td@depthof#1{%
+  \pgfutil@in@({#1}%
+  \ifpgfutil@in@
+    \begingroup
+    \tikz@scan@one@point\pgfutil@firstofone#1\relax
+    \xdef\tikz@td@gtmpa{\fpeval{round(\pgf@sys@tonumber\tikz@td@z
+      +\pgf@sys@tonumber\tikz@td@sd,3)}}%
+    \pgfpointtransformed{\pgfqpoint{\pgf@x}{\pgf@y}}%
+    \xdef\tikz@td@gtmpb{{\pgf@sys@tonumber\pgf@x}{\pgf@sys@tonumber\pgf@y}{\tikz@td@gtmpa}}%
+    \endgroup
+    \let\tikz@td@depthval\tikz@td@gtmpa\let\tikz@td@depthpt\tikz@td@gtmpb
+  \else
+    \edef\tikz@td@depthval{#1}\let\tikz@td@depthpt\pgfutil@empty
+  \fi}%
+% \tikz@td@piece@open{<spec>} ... \tikz@td@piece@close: everything in between
+% goes to a new piece; an empty <spec> means the depth is accumulated
+\def\tikz@td@piece@open#1{%
+  \tikz@td@depthof{#1}%
+  \ifx\tikz@td@depthval\pgfutil@empty
+    \ifdefined\tikz@td@depthkey\let\tikz@td@depthval\tikz@td@depthkey\fi
+  \fi
+  \global\advance\tikz@td@npieces by1\relax
+  \edef\tikz@td@tmpidx{\the\tikz@td@npieces}%
+  \ifcsname tikz@td@pbox@\tikz@td@tmpidx\endcsname\else
+    \expandafter\newbox\csname tikz@td@pbox@\tikz@td@tmpidx\endcsname
+  \fi
+  \expandafter\xdef\csname tikz@td@pacc@\tikz@td@tmpidx\endcsname{0,0}%
+  \expandafter\gdef\csname tikz@td@ppts@\tikz@td@tmpidx\endcsname{}%
+  \expandafter\xdef\csname tikz@td@prep@\tikz@td@tmpidx\endcsname{\tikz@td@depthpt}%
+  \expandafter\xdef\csname tikz@td@pext@\tikz@td@tmpidx\endcsname{\tikz@td@kext}%
+  \expandafter\xdef\csname tikz@td@pns@\tikz@td@tmpidx\endcsname{\tikz@td@knosphere}%
+  \expandafter\xdef\csname tikz@td@pfl@\tikz@td@tmpidx\endcsname{1}%
+  \expandafter\xdef\csname tikz@td@pdep@\tikz@td@tmpidx\endcsname{\tikz@td@depthval}%
+  \expandafter\xdef\csname tikz@td@play@\tikz@td@tmpidx\endcsname{\pgfonlayer@name}%
+  \global\expandafter\setbox\csname tikz@td@pbox@\tikz@td@tmpidx\endcsname=\hbox to 0pt\bgroup
+    \let\tikz@td@piece@idx\tikz@td@tmpidx
+    \pgfsys@beginscope\tikz@td@scene@state
+    \begingroup}%
+\def\tikz@td@piece@close{%
+    \endgroup
+    \pgfsys@endscope
+    \hss
+  \expandafter\egroup\expandafter\tikz@td@piece@register\expandafter{\tikz@td@piece@idx}}%
+% an automatic piece also records whether its path fills or shades
+\def\tikz@td@piece@close@path{%
+    \endgroup
+    \pgfsys@endscope
+    \hss
+  \expandafter\egroup\expandafter\tikz@td@piece@register@path\expandafter{\tikz@td@piece@idx}}%
+\def\tikz@td@piece@register@path#1{%
+  \expandafter\xdef\csname tikz@td@pfl@#1\endcsname{\iftikz@td@pfill1\else0\fi}%
+  \tikz@td@piece@register{#1}}%
+% \tikz@td@piece{<spec>}{<code>}: <code> as one piece (paths in it do not
+% become pieces of their own); outside a scene just <code>
+\long\def\tikz@td@piece#1#2{%
+  \iftikz@td@scene
+    \tikz@td@piece@open{#1}\tikz@td@explicittrue#2\tikz@td@piece@close
+  \else#2\fi}%
+% the points of a path accumulate their depths in the current piece, and
+% their canvas positions and depths in its list of points
+\let\tikz@td@noscene@makelast\tikz@make@last@position
+\def\tikz@make@last@position#1{\tikz@td@noscene@makelast{#1}%
+  \ifx\tikz@td@piece@idx\relax\else\iftikz@td@zok
+    \expandafter\expandafter\expandafter\tikz@td@piece@acc
+    \csname tikz@td@pacc@\tikz@td@piece@idx\endcsname\relax
+  \fi\fi}%
+% With x and y along the canvas axes (3d/screen coords) the drawing is flat,
+% and its literal points lie in the screen plane through the origin; named
+% coordinates keep their depth.
+\def\tikz@td@piece@acc#1,#2\relax{%
+  \begingroup
+  \dimen@=\tikz@td@sd
+  \advance\dimen@\tikz@td@z
+  \iftikz@td@simple
+    \ifdim\pgf@xx=1cm\ifdim\pgf@yy=1cm\ifdim\pgf@xy=0pt\ifdim\pgf@yx=0pt
+      \dimen@=\tikz@td@sd
+    \fi\fi\fi\fi
+  \fi
+  \expandafter\xdef\csname tikz@td@pacc@\tikz@td@piece@idx\endcsname{%
+    \fpeval{#1+\pgf@sys@tonumber\dimen@},\the\numexpr#2+1\relax}%
+  \pgfpointtransformed{\pgfqpoint{\tikz@lastx}{\tikz@lasty}}%
+  \expandafter\xdef\csname tikz@td@ppts@\tikz@td@piece@idx\endcsname{%
+    \csname tikz@td@ppts@\tikz@td@piece@idx\endcsname
+    {{\pgf@sys@tonumber\pgf@x}{\pgf@sys@tonumber\pgf@y}{\pgf@sys@tonumber\dimen@}}}%
+  \endgroup}%
+% pieces without a depth (e.g. a lone node at a named coordinate) go in front
+\def\tikz@td@piece@register#1{%
+  \edef\tikz@td@pdepth{\csname tikz@td@pdep@#1\endcsname}%
+  \ifx\tikz@td@pdepth\pgfutil@empty
+    \expandafter\expandafter\expandafter\tikz@td@piece@mean
+    \csname tikz@td@pacc@#1\endcsname\relax
+  \fi
+  \tikz@td@piece@gput{\tikz@td@pdepth}{#1}{\csname tikz@td@pext@#1\endcsname}}%
+\def\tikz@td@piece@mean#1,#2\relax{%
+  \ifnum#2=0 \def\tikz@td@pdepth{front}\else
+  \edef\tikz@td@pdepth{\fpeval{round((#1)/#2,3)}}\fi}%
+% graphic state set by scopes inside the scene
+\def\tikz@td@scene@record#1{\iftikz@td@scene
+  \expandafter\def\expandafter\tikz@td@scene@state\expandafter{\tikz@td@scene@state#1}\fi}%
+\let\tikz@td@orig@pgfsetlinewidth\pgfsetlinewidth
+\def\pgfsetlinewidth#1{\tikz@td@orig@pgfsetlinewidth{#1}%
+  \expandafter\tikz@td@scene@record\expandafter{\expandafter
+  \pgfsys@setlinewidth\expandafter{\the\pgflinewidth}}\ignorespaces}%
+\let\tikz@td@orig@pgfsetdash\pgfsetdash
+\def\pgfsetdash#1#2{\tikz@td@orig@pgfsetdash{#1}{#2}%
+  \tikz@td@scene@record{\pgfsetdash{#1}{#2}}\ignorespaces}%
+% \tikz@td@wrap{<name>}{<parameters>}{<arguments>}: \<name> also records itself
+\def\tikz@td@wrap#1#2#3{%
+  \expandafter\let\csname tikz@td@orig@#1\expandafter\endcsname\csname#1\endcsname
+  \expandafter\edef\csname#1\endcsname#2{%
+    \expandafter\noexpand\csname tikz@td@orig@#1\endcsname#3%
+    \noexpand\tikz@td@scene@record{\expandafter\noexpand\csname tikz@td@orig@#1\endcsname#3}}}%
+\tikz@td@wrap{pgf@setcolor}{#1#2#3#4#5}{{#1}{#2}{#3}{#4}{#5}}%
+\tikz@td@wrap{pgf@setstrokecolor}{#1#2#3#4#5}{{#1}{#2}{#3}{#4}{#5}}%
+\tikz@td@wrap{pgf@setfillcolor}{#1#2#3#4#5}{{#1}{#2}{#3}{#4}{#5}}%
+% a bare color option of a scope uses the color stack of the driver, which is
+% popped before the pieces are emitted
+\let\tikz@td@orig@compat@color@set\tikz@compat@color@set
+\def\tikz@compat@color@set#1{\tikz@td@orig@compat@color@set{#1}%
+  \expandafter\tikz@td@scene@record\expandafter{\expandafter
+  \tikz@td@orig@pgf@setcolor\pgf@temp}}%
+\tikz@td@wrap{pgfsetstrokeopacity}{#1}{{#1}}%
+\tikz@td@wrap{pgfsetfillopacity}{#1}{{#1}}%
+\tikz@td@wrap{pgfsetbuttcap}{}{}\tikz@td@wrap{pgfsetroundcap}{}{}%
+\tikz@td@wrap{pgfsetrectcap}{}{}\tikz@td@wrap{pgfsetmiterjoin}{}{}%
+\tikz@td@wrap{pgfsetbeveljoin}{}{}\tikz@td@wrap{pgfsetroundjoin}{}{}%
+\ExplSyntaxOn
+\cs_generate_variant:Nn \tl_gset:Nn { ce }
+\tl_new:N \l__tdtools_line_tl
+\seq_new:N \g__tdtools_pieces_seq
+\seq_new:N \g__tdtools_spheres_seq
+\seq_new:N \l__tdtools_out_seq
+\seq_new:N \l__tdtools_lines_seq
+\seq_new:N \l__tdtools_lcuts_seq
+\seq_new:N \l__tdtools_lpts_seq
+\tl_new:N \l__tdtools_key_tl
+\tl_new:N \l__tdtools_lay_tl
+\cs_new_protected:Npn \tikz@td@piece@gput #1#2#3
+  { \seq_gput_right:Ne \g__tdtools_pieces_seq { {#1} {#2} {#3} } }
+\cs_new_protected:Npn \tikz@td@sphere@gput #1
+  { \seq_gput_right:Ne \g__tdtools_spheres_seq { #1 } }
+\cs_new:Npn \__tdtools_key:n #1
+  { \str_case:nnF {#1} { { front } { 16000 } { back } { -16000 } } {#1} }
+\cs_new:Npn \__tdtools_item_key:nnnnnn #1#2#3#4#5#6 { \__tdtools_key:n {#1} }
+\cs_new:Npn \__tdtools_item_ext:nnnnnn #1#2#3#4#5#6 {#3}
+% --- geometry of a piece: tikz@td@pr@<i> = {x}{y}{depth}, tikz@td@pb@<i> =
+% {x0}{y0}{x1}{y1} (canvas, pt), both empty if unknown; tikz@td@pl@<i> =
+% {x0}{y0}{d0}{x1}{y1}{d1} for a straight path to be cut into runs
+\fp_new:N \l__tdtools_gx_fp \fp_new:N \l__tdtools_gy_fp \fp_new:N \l__tdtools_gd_fp
+\fp_new:N \l__tdtools_gxa_fp \fp_new:N \l__tdtools_gya_fp
+\fp_new:N \l__tdtools_gxb_fp \fp_new:N \l__tdtools_gyb_fp
+\int_new:N \l__tdtools_gn_int
+\cs_new_protected:Npn \__tdtools_geom:n #1
+  {
+    \tl_gclear:c { tikz@td@pl@#1 }
+    \tl_set:Ne \l__tdtools_tmp_tl { \use:c { tikz@td@prep@#1 } }
+    \tl_if_empty:NTF \l__tdtools_tmp_tl
+      {
+        \fp_zero:N \l__tdtools_gx_fp \fp_zero:N \l__tdtools_gy_fp \fp_zero:N \l__tdtools_gd_fp
+        \fp_set:Nn \l__tdtools_gxa_fp { 16000 } \fp_set:Nn \l__tdtools_gya_fp { 16000 }
+        \fp_set:Nn \l__tdtools_gxb_fp { -16000 } \fp_set:Nn \l__tdtools_gyb_fp { -16000 }
+        \int_zero:N \l__tdtools_gn_int
+        \tl_map_inline:cn { tikz@td@ppts@#1 } { \__tdtools_geom_pt:nnn ##1 }
+        \int_compare:nNnTF { \l__tdtools_gn_int } = { 0 }
+          { \tl_gclear:c { tikz@td@pr@#1 } \tl_gclear:c { tikz@td@pb@#1 } }
+          {
+            \tl_gset:ce { tikz@td@pr@#1 }
+              {
+                { \fp_eval:n { \l__tdtools_gx_fp / \l__tdtools_gn_int } }
+                { \fp_eval:n { \l__tdtools_gy_fp / \l__tdtools_gn_int } }
+                { \fp_eval:n { \l__tdtools_gd_fp / \l__tdtools_gn_int } }
+              }
+            \tl_gset:ce { tikz@td@pb@#1 }
+              {
+                { \fp_eval:n { \l__tdtools_gxa_fp - 2 } } { \fp_eval:n { \l__tdtools_gya_fp - 2 } }
+                { \fp_eval:n { \l__tdtools_gxb_fp + 2 } } { \fp_eval:n { \l__tdtools_gyb_fp + 2 } }
+              }
+            \__tdtools_lineckeck:n {#1}
+          }
+      }
+      {
+        \tl_gset_eq:cN { tikz@td@pr@#1 } \l__tdtools_tmp_tl
+        \exp_last_unbraced:NV \__tdtools_geom_box:nnnn \l__tdtools_tmp_tl {#1}
+      }
+  }
+\cs_new_protected:Npn \__tdtools_geom_box:nnnn #1#2#3#4
+  {
+    \fp_set:Nn \l_tmpa_fp { \use:c { tikz@td@pext@#4 } * 28.45274 + 2 }
+    \tl_gset:ce { tikz@td@pb@#4 }
+      {
+        { \fp_eval:n { #1 - \l_tmpa_fp } } { \fp_eval:n { #2 - \l_tmpa_fp } }
+        { \fp_eval:n { #1 + \l_tmpa_fp } } { \fp_eval:n { #2 + \l_tmpa_fp } }
+      }
+  }
+\cs_new_protected:Npn \__tdtools_geom_pt:nnn #1#2#3
+  {
+    \int_incr:N \l__tdtools_gn_int
+    \fp_add:Nn \l__tdtools_gx_fp {#1} \fp_add:Nn \l__tdtools_gy_fp {#2} \fp_add:Nn \l__tdtools_gd_fp {#3}
+    \fp_set:Nn \l__tdtools_gxa_fp { min ( \l__tdtools_gxa_fp , #1 ) }
+    \fp_set:Nn \l__tdtools_gya_fp { min ( \l__tdtools_gya_fp , #2 ) }
+    \fp_set:Nn \l__tdtools_gxb_fp { max ( \l__tdtools_gxb_fp , #1 ) }
+    \fp_set:Nn \l__tdtools_gyb_fp { max ( \l__tdtools_gyb_fp , #2 ) }
+  }
+% a path to be cut into runs: automatic, no fill, all points on the 3d line
+% through the first and the last one (within 0.5pt), depth varying by more
+% than 3d/split
+\fp_new:N \l__tdtools_sx_fp
+\fp_new:N \l__tdtools_sy_fp
+\fp_new:N \l__tdtools_sd_fp
+\cs_new_protected:Npn \__tdtools_lineckeck:n #1
+  {
+    \tl_set:Ne \l__tdtools_key_tl { \use:c { tikz@td@pdep@#1 } }
+    \bool_lazy_or:nnF
+      { \str_if_eq_p:ee { \use:c { tikz@td@pfl@#1 } } { 1 } }
+      { ! \tl_if_empty_p:N \l__tdtools_key_tl }
+      {
+        \seq_clear:N \l__tdtools_lpts_seq
+        \tl_map_inline:cn { tikz@td@ppts@#1 } { \seq_put_right:Nn \l__tdtools_lpts_seq {##1} }
+        \int_compare:nNnT { \seq_count:N \l__tdtools_lpts_seq } > { 1 }
+          {
+            \__tdtools_linecheck:een
+              { \seq_item:Nn \l__tdtools_lpts_seq { 1 } }
+              { \seq_item:Nn \l__tdtools_lpts_seq { -1 } } {#1}
+          }
+      }
+  }
+\cs_new_protected:Npn \__tdtools_linecheck:nnn #1#2#3
+  { \__tdtools_linecheck:nnnnnnn #1 #2 {#3} }
+\cs_generate_variant:Nn \__tdtools_linecheck:nnn { een }
+\cs_new_protected:Npn \__tdtools_linecheck:nnnnnnn #1#2#3#4#5#6#7
+  {
+    \fp_set:Nn \l__tdtools_sx_fp { #4 - #1 }
+    \fp_set:Nn \l__tdtools_sy_fp { #5 - #2 }
+    \fp_set:Nn \l__tdtools_sd_fp { #6 - #3 }
+    \bool_set_true:N \l_tmpa_bool
+    \seq_map_inline:Nn \l__tdtools_lpts_seq
+      { \__tdtools_linept:nnnnnn {#1} {#2} {#3} ##1 }
+    \bool_lazy_all:nT
+      {
+        { \l_tmpa_bool }
+        { \fp_compare_p:nNn { sqrt ( \l__tdtools_sx_fp ^ 2 + \l__tdtools_sy_fp ^ 2 ) } > { 1 } }
+        { \fp_compare_p:nNn { abs ( \l__tdtools_sd_fp ) } >
+            { \dim_to_fp:n { \pgfkeysvalueof { /tikz/3d/split } } } }
+        { ! \fp_compare_p:nNn { \dim_to_fp:n { \pgfkeysvalueof { /tikz/3d/split } } } = { 0 } }
+      }
+      { \tl_gset:cn { tikz@td@pl@#7 } { {#1} {#2} {#3} {#4} {#5} {#6} } }
+  }
+\cs_new_protected:Npn \__tdtools_linept:nnnnnn #1#2#3#4#5#6
+  {
+    \fp_compare:nNnT
+      {
+        sqrt (
+          ( (#5-#2) * \l__tdtools_sd_fp - (#6-#3) * \l__tdtools_sy_fp ) ^ 2
+          + ( (#6-#3) * \l__tdtools_sx_fp - (#4-#1) * \l__tdtools_sd_fp ) ^ 2
+          + ( (#4-#1) * \l__tdtools_sy_fp - (#5-#2) * \l__tdtools_sx_fp ) ^ 2 )
+      } >
+      { 0.5 * sqrt ( \l__tdtools_sx_fp ^ 2 + \l__tdtools_sy_fp ^ 2 + \l__tdtools_sd_fp ^ 2 ) }
+      { \bool_set_false:N \l_tmpa_bool }
+  }
+% --- spheres: {x}{y}{center depth}{radius}{front depth}{back depth}
+% \__tdtools_sphere:nnn {<key>} {<point>} : new key in \l__tdtools_key_tl
+\cs_new_protected:Npn \__tdtools_place:nn #1#2
+  {
+    \tl_set:Ne \l__tdtools_key_tl {#1}
+    \tl_if_empty:nF {#2}
+      {
+        \seq_map_inline:Nn \g__tdtools_spheres_seq
+          { \__tdtools_place:nnnnnnnnn ##1 #2 }
+      }
+  }
+\cs_new_protected:Npn \__tdtools_place:nnnnnnnnn #1#2#3#4#5#6#7#8#9
+  {
+    \fp_set:Nn \l_tmpa_fp { sqrt ( (#7 - #1) ^ 2 + (#8 - #2) ^ 2 ) }
+    \fp_compare:nNnT { \l_tmpa_fp } < { 1.02 * #4 }
+      {
+        \fp_set:Nn \l_tmpb_fp { sqrt ( \l_tmpa_fp ^ 2 + (#9 - #3) ^ 2 ) }
+        \fp_compare:nNnF { \l_tmpb_fp } < { 0.98 * #4 }
+          {
+            \fp_compare:nNnTF { \l_tmpb_fp } > { 1.02 * #4 }
+              {
+                % outside
+                \fp_compare:nNnTF {#9} < {#3}
+                  { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { min ( \l__tdtools_key_tl , #6 - 0.01 ) } } }
+                  { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { max ( \l__tdtools_key_tl , #5 + 0.02 ) } } }
+              }
+              {
+                % on the surface
+                \fp_compare:nNnTF {#9} < {#3}
+                  { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { #6 + 0.01 } } }
+                  { \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { #5 + 0.01 } } }
+              }
+          }
+      }
+  }
+% --- the flush
+\cs_new_protected:Npn \tikz@td@scene@flush
+  {
+    \seq_clear:N \l__tdtools_out_seq
+    \seq_clear:N \l__tdtools_lines_seq
+    \seq_map_inline:Nn \g__tdtools_pieces_seq { \__tdtools_geom:n { \use_ii:nnn ##1 } }
+    % pieces that are not cut: placed with respect to the spheres
+    \seq_map_inline:Nn \g__tdtools_pieces_seq { \__tdtools_flush_piece:nnn ##1 }
+    % straight paths: runs, cut at the depths of the pieces near them
+    \seq_map_inline:Nn \l__tdtools_lines_seq { \__tdtools_flush_line:nnn ##1 }
+    \seq_sort:Nn \l__tdtools_out_seq
+      {
+        \fp_compare:nNnTF
+          { \__tdtools_item_key:nnnnnn ##1 } > { \__tdtools_item_key:nnnnnn ##2 }
+          { \sort_return_swapped: }
+          {
+            \bool_lazy_and:nnTF
+              { \fp_compare_p:nNn { \__tdtools_item_key:nnnnnn ##1 } = { \__tdtools_item_key:nnnnnn ##2 } }
+              { \fp_compare_p:nNn { \__tdtools_item_ext:nnnnnn ##1 } < { \__tdtools_item_ext:nnnnnn ##2 } }
+              { \sort_return_swapped: } { \sort_return_same: }
+          }
+      }
+    \seq_map_inline:Nn \l__tdtools_out_seq { \__tdtools_emit:nnnnnn ##1 }
+    \seq_map_inline:Nn \l__tdtools_lines_seq
+      { \tex_global:D \tex_setbox:D \use:c { tikz@td@pbox@ \use_ii:nnn ##1 } = \tex_box:D \c_empty_box }
+    \seq_gclear:N \g__tdtools_pieces_seq
+    \seq_gclear:N \g__tdtools_spheres_seq
+    \global \tikz@td@npieces = 0 \scan_stop:
+  }
+% entries of \l__tdtools_out_seq: {key}{piece}{extent}{kind}{a}{b}; kind n
+% is the box, kind r a run of a straight path from a to b (fractions of it)
+\cs_new_protected:Npn \__tdtools_flush_piece:nnn #1#2#3
+  {
+    \tl_if_empty:cTF { tikz@td@pl@#2 }
+      {
+        \tl_set:Ne \l__tdtools_key_tl { \__tdtools_key:n {#1} }
+        \str_if_eq:eeF { \use:c { tikz@td@pns@#2 } } { 1 }
+          {
+            \str_case:nnF {#1} { { front } { } { back } { } }
+              { \exp_args:Nee \__tdtools_place:nn { \l__tdtools_key_tl } { \use:c { tikz@td@pr@#2 } } }
+          }
+        \seq_put_right:Ne \l__tdtools_out_seq { { \l__tdtools_key_tl } {#2} {#3} { n } { } { } }
+      }
+      { \seq_put_right:Nn \l__tdtools_lines_seq { {#1} {#2} {#3} } }
+  }
+\cs_new_protected:Npn \__tdtools_flush_line:nnn #1#2#3
+  { \exp_last_unbraced:Nv \__tdtools_flush_line:nnnnnnnn { tikz@td@pl@#2 } {#2} {#3} }
+\cs_new_protected:Npn \__tdtools_flush_line:nnnnnnnn #1#2#3#4#5#6#7#8
+  {
+    % cuts: keys of the pieces near the path, strictly inside its depth range,
+    % as fractions of the path
+    \seq_clear:N \l__tdtools_lcuts_seq
+    \tl_set:Nn \l__tdtools_line_tl { {#1} {#2} {#3} {#4} {#5} {#6} }
+    \seq_map_inline:Nn \l__tdtools_out_seq { \__tdtools_cut:nnnnnn ##1 }
+    \seq_sort:Nn \l__tdtools_lcuts_seq
+      { \fp_compare:nNnTF {##1} > {##2} { \sort_return_swapped: } { \sort_return_same: } }
+    \seq_remove_duplicates:N \l__tdtools_lcuts_seq
+    \seq_put_left:Nn \l__tdtools_lcuts_seq { -1000 }
+    \seq_put_right:Nn \l__tdtools_lcuts_seq { 1000 }
+    \tl_clear:N \l__tdtools_prev_tl
+    \seq_map_inline:Nn \l__tdtools_lcuts_seq
+      {
+        \tl_if_empty:NF \l__tdtools_prev_tl
+          {
+            % the run from prev to ##1: depth and point of its middle (within the path)
+            \fp_set:Nn \l_tmpa_fp { ( max ( \l__tdtools_prev_tl , 0 ) + min ( ##1 , 1 ) ) / 2 }
+            \tl_set:Ne \l__tdtools_key_tl { \fp_eval:n { #3 + \l_tmpa_fp * (#6 - #3) } }
+            \exp_args:Nee \__tdtools_place:nn { \l__tdtools_key_tl }
+              {
+                { \fp_eval:n { #1 + \l_tmpa_fp * (#4 - #1) } }
+                { \fp_eval:n { #2 + \l_tmpa_fp * (#5 - #2) } }
+                { \l__tdtools_key_tl }
+              }
+            \seq_put_right:Ne \l__tdtools_out_seq
+              {
+                { \l__tdtools_key_tl } {#7} {#8}
+                { \int_compare:nNnTF { \seq_count:N \l__tdtools_lcuts_seq } = { 2 } { n } { r } }
+                { \l__tdtools_prev_tl } {##1}
+              }
+          }
+        \tl_set:Nn \l__tdtools_prev_tl {##1}
+      }
+  }
+% an entry {key}{piece}{extent}{kind}{a}{b} of the list against the path
+% \l__tdtools_line_tl
+\cs_new_protected:Npn \__tdtools_cut:nnnnnn #1#2#3#4#5#6
+  { \exp_last_unbraced:NV \__tdtools_cut_aux:nnnnnnnn \l__tdtools_line_tl {#1} {#2} }
+\cs_new_protected:Npn \__tdtools_cut_aux:nnnnnnnn #1#2#3#4#5#6#7#8
+  {
+    \fp_compare:nNnT
+      { ( #7 - #3 ) * ( #7 - #6 ) } < { -0.0001 }
+      {
+        \tl_set:Ne \l__tdtools_tmp_tl { \use:c { tikz@td@pb@#8 } }
+        \bool_if:nT
+          {
+            \tl_if_empty_p:N \l__tdtools_tmp_tl
+            || \exp_last_unbraced:NV \__tdtools_boxhit_p:nnnnnnnn \l__tdtools_tmp_tl {#1} {#2} {#4} {#5}
+          }
+          { \seq_put_right:Ne \l__tdtools_lcuts_seq { \fp_eval:n { ( #7 - #3 ) / ( #6 - #3 ) } } }
+      }
+  }
+% does the box {x0}{y0}{x1}{y1} meet the bounding box of the segment?
+\prg_new_conditional:Npnn \__tdtools_boxhit:nnnnnnnn #1#2#3#4#5#6#7#8 { p }
+  {
+    \bool_lazy_all:nTF
+      {
+        { \fp_compare_p:nNn {#1} < { max (#5, #7) + 1 } }
+        { \fp_compare_p:nNn {#3} > { min (#5, #7) - 1 } }
+        { \fp_compare_p:nNn {#2} < { max (#6, #8) + 1 } }
+        { \fp_compare_p:nNn {#4} > { min (#6, #8) - 1 } }
+      }
+      { \prg_return_true: } { \prg_return_false: }
+  }
+\cs_new_protected:Npn \__tdtools_emit:nnnnnn #1#2#3#4#5#6
+  {
+    \tl_set:Ne \l__tdtools_lay_tl { \use:c { tikz@td@play@#2 } }
+    \str_if_eq:eeTF { \l__tdtools_lay_tl } { \pgfonlayer@name }
+      { \__tdtools_emit_box:nnnn {#2} {#4} {#5} {#6} }
+      {
+        \exp_args:NV \pgfonlayer \l__tdtools_lay_tl
+          \__tdtools_emit_box:nnnn {#2} {#4} {#5} {#6}
+        \endpgfonlayer
+      }
+  }
+\cs_new_protected:Npn \__tdtools_emit_box:nnnn #1#2#3#4
+  {
+    \str_if_eq:nnTF {#2} { n }
+      { \tex_copy:D \use:c { tikz@td@pbox@#1 } }
+      {
+        \pgfscope
+          \pgftransformreset
+          \group_begin:
+            \pgf@relevantforpicturesizefalse
+            \exp_last_unbraced:Nv \__tdtools_runpath:nnnnnnnn { tikz@td@pl@#1 } {#3} {#4}
+            \pgfusepath { clip }
+          \group_end:
+          \tex_copy:D \use:c { tikz@td@pbox@#1 }
+        \endpgfscope
+      }
+  }
+% the band across the path from the fraction #7 to #8 (overlapping its
+% neighbours by 0.25pt; the outer runs reach far beyond the ends)
+\cs_new_protected:Npn \__tdtools_runpath:nnnnnnnn #1#2#3#4#5#6#7#8
+  {
+    \fp_set:Nn \l__tdtools_sx_fp { #4 - #1 }
+    \fp_set:Nn \l__tdtools_sy_fp { #5 - #2 }
+    \fp_set:Nn \l_tmpb_fp { sqrt ( \l__tdtools_sx_fp ^ 2 + \l__tdtools_sy_fp ^ 2 ) }
+    \fp_set:Nn \l_tmpa_fp
+      { \fp_compare:nNnTF {#7} < { -1 } { -1000 } { #7 * \l_tmpb_fp - 0.25 } }
+    \fp_set:Nn \l__tdtools_sd_fp
+      { \fp_compare:nNnTF {#8} > { 2 } { \l_tmpb_fp + 1000 } { #8 * \l_tmpb_fp + 0.25 } }
+    \__tdtools_runpt:nnnnn {#1} {#2} { \l_tmpa_fp } { 1000 } { moveto }
+    \__tdtools_runpt:nnnnn {#1} {#2} { \l__tdtools_sd_fp } { 1000 } { lineto }
+    \__tdtools_runpt:nnnnn {#1} {#2} { \l__tdtools_sd_fp } { -1000 } { lineto }
+    \__tdtools_runpt:nnnnn {#1} {#2} { \l_tmpa_fp } { -1000 } { lineto }
+    \pgfpathclose
+  }
+\cs_new_protected:Npn \__tdtools_runpt:nnnnn #1#2#3#4#5
+  {
+    \use:c { pgfpath#5 }
+      {
+        \pgfqpoint
+          { \fp_eval:n { #1 + ( #3 * \l__tdtools_sx_fp - #4 * \l__tdtools_sy_fp ) / \l_tmpb_fp } pt }
+          { \fp_eval:n { #2 + ( #3 * \l__tdtools_sy_fp + #4 * \l__tdtools_sx_fp ) / \l_tmpb_fp } pt }
+      }
+  }
+\ExplSyntaxOff
+\tikzset{3d/scene/.code={%
+  \iftikz@td@scene\else
+    \tikz@td@scenetrue
+    \let\tikz@td@scene@pic\pgfpictureid
+    \let\tikz@td@scene@state\pgfutil@empty
+    \let\tikz@@command@path\tikz@td@scene@path
+    % occlusion decides what is seen of hidden edges: draw them like visible ones
+    \tikzset{3d/hidden/.style={draw,solid},execute at end scope={\tikz@td@scene@flush}}%
+  \fi},%
+  % straight paths whose depth varies by more than this get cut where they
+  % pass other pieces
+  3d/split/.initial=0.2mm,%
+  % caps of sub-arcs: butt caps leave a notch where a thick stroke turns
+  % sharply (a circle seen almost edge-on), round caps of translucent strokes
+  % overlap; round caps from 1pt on
+  3d/joint caps/.code={\tikz@addoption{\ifdim\pgflinewidth<1pt\else\pgfsetroundcap\fi}},%
+  % a path style without its fill, shading and path picture
+  3d/edge only/.code={\tikz@addmode{\tikz@mode@fillfalse\tikz@mode@shadefalse}%
+    \let\tikz@path@picture\pgfutil@empty},%
+  % depth of the pieces of the current path or scope: front, back or a point
+  3d/depth/.code={%
+    \tikz@td@depthof{#1}\let\tikz@td@depthkey\tikz@td@depthval
+    \ifx\tikz@td@piece@idx\relax\else
+      \expandafter\xdef\csname tikz@td@pdep@\tikz@td@piece@idx\endcsname{\tikz@td@depthval}%
+    \fi}}%
 \makeatother
 \endinput
