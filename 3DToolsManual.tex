@@ -186,6 +186,17 @@ this is ever to become a CTAN library/package.
    Yields the $z$-component of a 3d expression.
 \end{math-function}
 
+\begin{codeexample}[preamble={\usetikzlibrary{3dtools}}]
+\begin{tikzpicture}
+ \path (1,2,3) coordinate (A) (2,3,-1) coordinate (B);
+ \node[align=left] {%
+  $A_x=\pgfmathparse{TDx("A")}\pgfmathprintnumber\pgfmathresult$,
+  $A_y=\pgfmathparse{TDy("(A)")}\pgfmathprintnumber\pgfmathresult$,
+  $(A-B)_z=\pgfmathparse{TDz("(A)-(B)")}\pgfmathprintnumber\pgfmathresult$,
+  $[(A)\times(B)]_x=\pgfmathparse{TDx("(A)x(B)")}\pgfmathprintnumber\pgfmathresult$};
+\end{tikzpicture}
+\end{codeexample}
+
 
 \begin{math-function}{TDunit("\mvar{vector}")}
    Yields the result of the expression normalized to unity. If the length of the
@@ -594,9 +605,9 @@ where
  \end{pmatrix}\;,\\
  R_z(\phi)&=
  \begin{pmatrix}
-  1 & 0 & 0 \\
-  0 & \cos (\phi ) & \sin (\phi ) \\
-  0 & -\sin (\phi ) & \cos (\phi ) \\
+  \cos (\phi ) & \sin (\phi ) & 0 \\
+  -\sin (\phi ) & \cos (\phi ) & 0 \\
+  0 & 0 & 1 \\
  \end{pmatrix}
 \end{align*}
 are rotations about the $x$, $y$ and $z$ axis, respectively.  For $\psi=0$,
@@ -1007,8 +1018,8 @@ quadratic equation, as they should, they correspond to the upper and lower
 contour in the code example below. They are a bit unilluminating and given by
 \begin{subequations}\label{eq:cvandsv}
 \begin{align}
- [\sin(v)]_{1,2}&=-\frac{a \sqrt{a^2+b^2-c^2}\pm b\,c}{a^2+b^2}\;,\\
- [\cos(v)]_{1,2}&=-\frac{b \sqrt{a^2+b^2-c^2}\mp a\,c}{a^2+b^2}\;,
+ [\sin(v)]_{1,2}&=\frac{-a\,c\pm b \sqrt{a^2+b^2-c^2}}{a^2+b^2}\;,\\
+ [\cos(v)]_{1,2}&=\frac{-b\,c\mp a \sqrt{a^2+b^2-c^2}}{a^2+b^2}\;,
 \end{align}
 \end{subequations}
 where $a$, $b$ and $c$ are implicitly defined in \eqref{eq:vcrit}. Hence, for
@@ -1959,6 +1970,17 @@ cylinders. They share a couple of common keys.
  \pic{cylinder={r=0.4,h=3,
  cylinder/axis={(1,0,1)},
  cylinder/top/.style={fill=blue}}};
+\end{tikzpicture}
+\end{codeexample}
+
+Seen along its axis, a cylinder shows only the cap facing the viewer, with its
+hole, or only the rim if it is open.
+\begin{codeexample}[width=5cm,preamble={\usetikzlibrary{3dtools}}]
+\begin{tikzpicture}[3d/install view={phi=0,psi=0,theta=0}]
+ \fill[red] (-1.2,-0.15) rectangle (4.2,0.15);
+ \pic{cylinder={r=1,h=2,cylinder/hole=0.5,
+  cylinder/top/.style={fill=blue!50,draw}}};
+ \pic at (3,0,0) {cylinder={r=1,h=2,cylinder/open=true}};
 \end{tikzpicture}
 \end{codeexample}
 

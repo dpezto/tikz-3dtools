@@ -444,6 +444,18 @@ install view/.style={/utils/exec=\tikzset{3d/.cd,#1}%
       }
     \__tdtools_return:e { \__tdtools_vec_tl: }
   }
+% components of a 3d expression; a bare name A means the coordinate (A)
+\cs_new_protected:Npn \__tdtools_component:nN #1#2
+  {
+    \group_begin:
+    \tl_if_in:nnTF {#1} { ( }
+      { \__tdtools_parse:n {#1} }
+      { \__tdtools_parse:n { (#1) } }
+    \__tdtools_return:e { \fp_to_decimal:N #2 }
+  }
+\pgfmathdeclarefunction{TDx}{1} { \__tdtools_component:nN {#1} \l__tdtools_rx_fp }
+\pgfmathdeclarefunction{TDy}{1} { \__tdtools_component:nN {#1} \l__tdtools_ry_fp }
+\pgfmathdeclarefunction{TDz}{1} { \__tdtools_component:nN {#1} \l__tdtools_rz_fp }
 \pgfmathdeclarefunction{tddistance}{2}
   {
     \group_begin:
@@ -561,21 +573,6 @@ install view/.style={/utils/exec=\tikzset{3d/.cd,#1}%
 \begingroup% 
 \pgfmathparse@td@FPU{#3}% 
 \pgfmathsmuggle\pgfmathresult\endgroup} 
-\pgfmathdeclarefunction{TDx}{1}{% x component of a 3-vector 
-\begingroup% 
-\edef\mycoord{\tikz@td@raw@coord(#1)}%
-\pgfmathparse@td@FPU{xcomp3\mycoord}% 
-\pgfmathsmuggle\pgfmathresult\endgroup}%
-\pgfmathdeclarefunction{TDy}{1}{% x component of a 3-vector 
-\begingroup% 
-\edef\mycoord{\tikz@td@raw@coord(#1)}%
-\pgfmathparse@td@FPU{ycomp3\mycoord}% 
-\pgfmathsmuggle\pgfmathresult\endgroup}%
-\pgfmathdeclarefunction{TDz}{1}{% x component of a 3-vector 
-\begingroup% 
-\edef\mycoord{\tikz@td@raw@coord(#1)}%
-\pgfmathparse@td@FPU{zcomp3\mycoord}% 
-\pgfmathsmuggle\pgfmathresult\endgroup}%
 % \pgfmathdeclarefunction{TDX}{1}{% x component of a 3-vector 
 % \begingroup% 
 % \edef\pgfmathresult{0}%
@@ -1419,7 +1416,7 @@ x2d("\pgfutil@tmpa")-x2d("\pgfutil@tmpd"))+\pgfutil@tmpe,360)}%
 \else
 \edef\pgfutil@tmpd{\pgfutil@tmpi}%
 \edef\pgfutil@tmpp{\pgfutil@tmpp--(\pgfutil@tmpd)}%
-\pgfmathsetmacro{\pgfutil@tmpe}{180+\pgfutil@tmpe-\pgfutil@tmpf}%
+\pgfmathsetmacro{\pgfutil@tmpe}{180+\pgfutil@tmpe-\pgfutil@tmpg}% angle of the selected point
 %\typeout{offset angle=\pgfutil@tmpe}%
 \advance\c@pgf@counta by-1%
 \fi
@@ -1653,6 +1650,7 @@ project/.code args={#1 on #2}{%
 %\typeout{debug: intersection is at (\pgfutil@tmpj)}%
 \else
 \PackageWarning{3dtools}{The plane and line do not intersect within the uncertainties. Returning (0,0,0) instead.}%
+\tikzset{insert path={(0,0,0)}}%
 \fi
 \fi
 \ifnum\pgfutil@tmpf=2\relax% line and sphere
@@ -1662,6 +1660,8 @@ project/.code args={#1 on #2}{%
 \pgfmathsetmacro@td@FPU{\pgfutil@tmpj}{sign(\pgfutil@tmph*\pgfutil@tmph-4*\pgfutil@tmpg*\pgfutil@tmpi)}%
 \ifnum\fpeval{\pgfutil@tmpj<0}=1\relax
 \PackageWarning{3dtools}{The sphere and line do not intersect within the uncertainties. Returning (0,0,0) instead.}%
+\tikzset{insert path={(0,0,0) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 1})
+  (0,0,0) coordinate (\pgfkeysvalueof{/tikz/3d/aux keys/intersection 2})}}%
 \else
 \pgfmathsetmacro@td@FPU{\pgfutil@tmpk}{-1*(\pgfutil@tmph+sqrt(\pgfutil@tmph*\pgfutil@tmph-4*\pgfutil@tmpg*\pgfutil@tmpi))/2/\pgfutil@tmpg}%
 %\typeout{k=\pgfutil@tmpk}
@@ -2962,9 +2962,16 @@ create faces from vertex list/.style={/tikz/3d/polyhedron/create face from verti
 \pgfmathsetmacro{\tikz@td@ez}{TDunit("\pgfkeysvalueof{/tikz/3d/cylinder/axis}")}%
 \tikz@td@cylinder@cap{\tikz@td@ez}%
 \ifnum\tikz@td@i=0\relax % seen along the axis: only the cap facing the viewer
-  \def\tikz@td@mantle{circle[radius=\pgfkeysvalueof{/tikz/3d/r}]}%
-  \tikz@td@cylinder@paintcap
-  \path[3d/cylinder/top] \tikz@td@mantle;
+  % with the hole and open ends as in the general view
+  \edef\tikz@td@mantle{(0,0) circle[radius=\pgfkeysvalueof{/tikz/3d/r}]
+    \ifdim\pgfkeysvalueof{/tikz/3d/cylinder/hole}pt>0pt
+      (0,0) circle[radius=\pgfkeysvalueof{/tikz/3d/cylinder/hole}]\fi}%
+  \ifcsname tikz@td@open@\pgfkeysvalueof{/tikz/3d/cylinder/open}\endcsname
+    \path[3d/cylinder/top,3d/edge only] \tikz@td@mantle;
+  \else
+    \tikz@td@iffills{/tikz/3d/cylinder/top}{}{\tikz@td@cylinder@paintcap}%
+    \path[even odd rule,3d/cylinder/top] \tikz@td@mantle;
+  \fi
 \else 
   \pgfmathsetmacro{\tikz@td@ex}{TDunit("\pgfkeysvalueof{/tikz/3d/cylinder/axis}x(nscreenx,nscreeny,nscreenz)")}%
   \pgfmathsetmacro{\tikz@td@ey}{TDunit("(\tikz@td@ex)x\pgfkeysvalueof{/tikz/3d/cylinder/axis}")}%
@@ -3282,7 +3289,7 @@ store array entry/.code={\advance\c@pgf@counta by1\relax
 { %
     \state{initial}[width=0.5*\pgfdecorationsegmentlength,%
     next state=coil, persistent precomputation={% from https://tex.stackexchange.com/a/25689/121799%
-    \pgfmathsetmacro\matchinglength{\pgfdecoratedinputsegmentlength / int(\pgfdecoratedinputsegmentlength/\pgfdecorationsegmentlength)}%
+    \pgfmathsetmacro\matchinglength{\pgfdecoratedinputsegmentlength / max(1,int(\pgfdecoratedinputsegmentlength/\pgfdecorationsegmentlength))}% at least one winding
     \setlength{\pgfdecorationsegmentlength}{\matchinglength pt}%
     %\tikzset{get stroke color}%
     \pgfmathsetmacro{\generaloffset}{\pgfdecorationsegmentlength}%
